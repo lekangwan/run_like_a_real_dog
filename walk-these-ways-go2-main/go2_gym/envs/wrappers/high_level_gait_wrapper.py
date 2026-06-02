@@ -1,0 +1,348 @@
+import torch
+
+
+class HighLevelGaitWrapper:
+    """Wrap a WTW env + frozen low-level policy as a high-level gait-parameter env.
+
+    High-level action in [-1, 1], shape [num_envs, 8]:
+      0-3: gait selector logits for pronking/trotting/bounding/pacing
+      4: gait frequency
+      5: foot swing height
+      6: stance width
+      7: body pitch
+    """
+
+    def __init__(
+        self,
+        env,
+        low_level_policy,
+        high_level_dt=0.10,
+        history_length=10,
+        action_smoothing=0.6,
+        record_reward_terms=False,
+        freq_range=(2.0, 3.5),
+        phase_range=(0.0, 0.5),
+        offset_range=(0.0, 0.5),
+        bound_range=(0.0, 0.5),
+        footswing_range=(0.04, 0.12),
+        stance_width_range=(0.25, 0.38),
+        body_pitch_range=(-0.10, 0.05),
+        selector_temperature=0.25,
+        velocity_tracking_sigma=0.25,
+        vx_abs_error_coef=0.25,
+        continuous_action_coef=0.03,
+        selector_reference_coef=1.0,
+        behavior_reference_coef=0.05,
+        action_delta_coef=0.05,
+        vertical_velocity_coef=0.05,
+    ):
+        self.env = env
+        self.low_level_policy = low_level_policy
+        self.high_level_dt = high_level_dt
+        self.low_level_steps = max(1, int(round(high_level_dt / self.env.dt)))
+        self.history_length = history_length
+        self.action_smoothing = action_smoothing
+        self.record_reward_terms = record_reward_terms
+
+        self.phase_range = phase_range
+        self.offset_range = offset_range
+        self.bound_range = bound_range
+        self.freq_range = freq_range
+        self.footswing_range = footswing_range
+        self.stance_width_range = stance_width_range
+        self.body_pitch_range = body_pitch_range
+        self.selector_temperature = selector_temperature
+        self.velocity_tracking_sigma = velocity_tracking_sigma
+        self.vx_abs_error_coef = vx_abs_error_coef
+        self.continuous_action_coef = continuous_action_coef
+        self.selector_reference_coef = selector_reference_coef
+        self.behavior_reference_coef = behavior_reference_coef
+        self.action_delta_coef = action_delta_coef
+        self.vertical_velocity_coef = vertical_velocity_coef
+
+        self.num_envs = self.env.num_envs
+        self.device = self.env.device
+        self.gait_names = ("pronking", "trotting", "bounding", "pacing")
+        self.gait_templates = torch.tensor(
+            (
+                (0.0, 0.0, 0.0),
+                (0.5, 0.0, 0.0),
+                (0.0, 0.5, 0.0),
+                (0.0, 0.0, 0.5),
+            ),
+            device=self.device,
+            dtype=torch.float,
+        )
+        self.num_gaits = len(self.gait_names)
+        self.num_behavior_actions = 4
+        self.num_high_level_actions = self.num_gaits + self.num_behavior_actions
+        self.num_high_level_obs = 40 + self.num_high_level_actions
+        self.num_high_level_obs_history = self.num_high_level_obs * self.history_length
+
+        self.high_level_action = torch.zeros(
+            self.num_envs, self.num_high_level_actions, device=self.device, dtype=torch.float
+        )
+        self.prev_high_level_action = torch.zeros_like(self.high_level_action)
+        self.velocity_command = torch.zeros(self.num_envs, 3, device=self.device, dtype=torch.float)
+        self.obs_history = torch.zeros(
+            self.num_envs,
+            self.num_high_level_obs_history,
+            device=self.device,
+            dtype=torch.float,
+        )
+        self.obs_shift_buffer = torch.zeros(
+            self.num_envs,
+            self.num_high_level_obs_history - self.num_high_level_obs,
+            device=self.device,
+            dtype=torch.float,
+        )
+        self.low_level_obs = None
+        self.last_reward_terms = {}
+
+    def reset(self):
+        self.low_level_obs = self.env.reset()
+        self.high_level_action.zero_()
+        self.prev_high_level_action.zero_()
+        self.obs_history.zero_()
+        return self.get_observations()
+
+    def set_velocity_command(self, vx, vy=0.0, yaw=0.0):
+        self.velocity_command[:, 0] = torch.as_tensor(vx, device=self.device, dtype=torch.float)
+        self.velocity_command[:, 1] = torch.as_tensor(vy, device=self.device, dtype=torch.float)
+        self.velocity_command[:, 2] = torch.as_tensor(yaw, device=self.device, dtype=torch.float)
+        self.env.commands[:, 0:3] = self.velocity_command
+
+    def step(self, high_level_action):
+        high_level_action = torch.clip(high_level_action.to(self.device), -1.0, 1.0).detach()
+        self.prev_high_level_action[:] = self.high_level_action
+        self.high_level_action[:] = (
+            self.action_smoothing * self.high_level_action
+            + (1.0 - self.action_smoothing) * high_level_action
+        )
+
+        rewards = torch.zeros(self.num_envs, device=self.device)
+        dones_accum = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        info = {}
+        reward_terms = None
+        if self.record_reward_terms:
+            reward_terms = {
+                "velocity_reward": torch.zeros(self.num_envs, device=self.device),
+                "yaw_reward": torch.zeros(self.num_envs, device=self.device),
+                "orientation_penalty": torch.zeros(self.num_envs, device=self.device),
+                "torque_penalty": torch.zeros(self.num_envs, device=self.device),
+                "slip_penalty": torch.zeros(self.num_envs, device=self.device),
+                "action_delta_penalty": torch.zeros(self.num_envs, device=self.device),
+                "continuous_action_penalty": torch.zeros(self.num_envs, device=self.device),
+                "selector_reference_penalty": torch.zeros(self.num_envs, device=self.device),
+                "behavior_reference_penalty": torch.zeros(self.num_envs, device=self.device),
+                "vx_abs_error_penalty": torch.zeros(self.num_envs, device=self.device),
+                "vertical_velocity_penalty": torch.zeros(self.num_envs, device=self.device),
+                "fall_penalty": torch.zeros(self.num_envs, device=self.device),
+            }
+
+        for _ in range(self.low_level_steps):
+            self._apply_high_level_action()
+            with torch.inference_mode():
+                low_action = self.low_level_policy(self.low_level_obs)
+            self.low_level_obs, _, dones, info = self.env.step(low_action.to(self.device))
+            rewards += self._compute_high_level_reward(dones)
+            if self.record_reward_terms:
+                for key, value in self.last_reward_terms.items():
+                    reward_terms[key] += value
+            dones_accum |= dones.bool()
+            del low_action
+
+        rewards /= self.low_level_steps
+        if self.record_reward_terms:
+            for key in reward_terms:
+                reward_terms[key] /= self.low_level_steps
+            info["high_level_reward_terms"] = reward_terms
+        return self.get_observations(), rewards, dones_accum, info
+
+    def get_observations(self):
+        current_obs = self._get_current_proprioceptive_obs()
+        self.obs_shift_buffer.copy_(self.obs_history[:, self.num_high_level_obs :])
+        self.obs_history[:, : -self.num_high_level_obs].copy_(self.obs_shift_buffer)
+        self.obs_history[:, -self.num_high_level_obs :].copy_(current_obs)
+        return self.obs_history.detach()
+
+    def _get_current_proprioceptive_obs(self):
+        velocity_error = torch.cat(
+            (
+                self.env.base_lin_vel[:, 0:2] - self.env.commands[:, 0:2],
+                (self.env.base_ang_vel[:, 2] - self.env.commands[:, 2]).unsqueeze(1),
+            ),
+            dim=-1,
+        )
+        dof_pos_error = self.env.dof_pos[:, : self.env.num_actuated_dof] - self.env.default_dof_pos[
+            :, : self.env.num_actuated_dof
+        ]
+        dof_vel = self.env.dof_vel[:, : self.env.num_actuated_dof]
+        contact_state = (self.env.contact_forces[:, self.env.feet_indices, 2] > 1.0).float()
+        obs = torch.cat(
+            (
+                velocity_error,
+                self.env.base_lin_vel,
+                self.env.base_ang_vel,
+                self.env.projected_gravity,
+                dof_pos_error,
+                dof_vel,
+                contact_state,
+                self.high_level_action,
+            ),
+            dim=-1,
+        )
+        return obs
+
+    def _apply_high_level_action(self):
+        mapped = self._map_action(self.high_level_action)
+        commands = self.env.commands
+
+        commands[:, 0:3] = self.velocity_command
+        commands[:, 4] = mapped["frequency"]
+        commands[:, 5] = mapped["phase"]
+        commands[:, 6] = mapped["offset"]
+        commands[:, 7] = mapped["bound"]
+        commands[:, 8] = 0.5
+        commands[:, 9] = mapped["footswing_height"]
+        commands[:, 10] = mapped["body_pitch"]
+        commands[:, 11] = 0.0
+        commands[:, 12] = mapped["stance_width"]
+        if commands.shape[1] > 13:
+            commands[:, 13] = 0.40
+
+    def _map_action(self, action):
+        selector_weights = self._selector_weights(action)
+        gait_command = selector_weights @ self.gait_templates
+        behavior_unit = 0.5 * (action[:, self.num_gaits :] + 1.0)
+        return {
+            "selector_weights": selector_weights,
+            "phase": gait_command[:, 0],
+            "offset": gait_command[:, 1],
+            "bound": gait_command[:, 2],
+            "frequency": self._lerp(behavior_unit[:, 0], *self.freq_range),
+            "footswing_height": self._lerp(behavior_unit[:, 1], *self.footswing_range),
+            "stance_width": self._lerp(behavior_unit[:, 2], *self.stance_width_range),
+            "body_pitch": self._lerp(behavior_unit[:, 3], *self.body_pitch_range),
+        }
+
+    def _selector_weights(self, action):
+        logits = action[:, : self.num_gaits] / self.selector_temperature
+        return torch.softmax(logits, dim=-1)
+
+    def _speed_conditioned_target(self):
+        speed = torch.clamp(torch.abs(self.env.commands[:, 0]), 0.0, 2.0)
+        speed_unit = speed / 2.0
+        high_speed_weight = torch.clamp((speed - 1.1) / 0.7, 0.0, 1.0)
+
+        target_selector_weights = torch.zeros(
+            self.num_envs, self.num_gaits, device=self.device, dtype=torch.float
+        )
+        target_selector_weights[:, 1] = 1.0 - high_speed_weight
+        target_selector_weights[:, 2] = high_speed_weight
+
+        target_frequency = 2.1 + 1.1 * speed_unit
+        target_footswing = 0.05 + 0.04 * speed_unit
+        target_stance_width = 0.36 - 0.05 * speed_unit
+        target_body_pitch = -0.01 - 0.05 * speed_unit
+
+        target_behavior_units = torch.stack(
+            (
+                self._inv_lerp(target_frequency, *self.freq_range),
+                self._inv_lerp(target_footswing, *self.footswing_range),
+                self._inv_lerp(target_stance_width, *self.stance_width_range),
+                self._inv_lerp(target_body_pitch, *self.body_pitch_range),
+            ),
+            dim=-1,
+        )
+        return target_selector_weights, torch.clamp(target_behavior_units, 0.0, 1.0)
+
+    def _map_target(self, target_selector_weights, target_behavior_units):
+        gait_command = target_selector_weights @ self.gait_templates
+        return {
+            "selector_weights": target_selector_weights,
+            "phase": gait_command[:, 0],
+            "offset": gait_command[:, 1],
+            "bound": gait_command[:, 2],
+            "frequency": self._lerp(target_behavior_units[:, 0], *self.freq_range),
+            "footswing_height": self._lerp(target_behavior_units[:, 1], *self.footswing_range),
+            "stance_width": self._lerp(target_behavior_units[:, 2], *self.stance_width_range),
+            "body_pitch": self._lerp(target_behavior_units[:, 3], *self.body_pitch_range),
+        }
+
+    @staticmethod
+    def _lerp(x, low, high):
+        return low + (high - low) * x
+
+    @staticmethod
+    def _inv_lerp(x, low, high):
+        return (x - low) / (high - low)
+
+    def _compute_high_level_reward(self, dones):
+        vx_error = self.env.base_lin_vel[:, 0] - self.env.commands[:, 0]
+        vy_error = self.env.base_lin_vel[:, 1] - self.env.commands[:, 1]
+        yaw_error = self.env.base_ang_vel[:, 2] - self.env.commands[:, 2]
+
+        velocity_reward = torch.exp(
+            -(vx_error**2 + 0.25 * vy_error**2) / self.velocity_tracking_sigma
+        )
+        yaw_reward = torch.exp(-(yaw_error**2) / 0.10)
+        orientation_penalty = torch.sum(self.env.projected_gravity[:, :2] ** 2, dim=1)
+        torque_penalty = torch.mean(self.env.torques**2, dim=1) / 100.0
+
+        contacts = self.env.contact_forces[:, self.env.feet_indices, 2] > 1.0
+        foot_xy_vel = torch.sum(self.env.foot_velocities[:, :, :2] ** 2, dim=2)
+        slip_penalty = torch.mean(contacts * foot_xy_vel, dim=1)
+
+        action_delta_penalty = torch.mean(
+            (self.high_level_action - self.prev_high_level_action) ** 2, dim=1
+        )
+        continuous_action_penalty = torch.mean(
+            self.high_level_action[:, self.num_gaits :] ** 2, dim=1
+        )
+        selector_weights = self._selector_weights(self.high_level_action)
+        target_selector_weights, target_behavior_units = self._speed_conditioned_target()
+        behavior_units = 0.5 * (self.high_level_action[:, self.num_gaits :] + 1.0)
+        selector_reference_penalty = torch.mean(
+            (selector_weights - target_selector_weights) ** 2, dim=1
+        )
+        behavior_reference_penalty = torch.mean(
+            (behavior_units - target_behavior_units) ** 2, dim=1
+        )
+        vx_abs_error_penalty = torch.abs(vx_error)
+        vertical_velocity_penalty = self.env.base_lin_vel[:, 2] ** 2
+
+        fall_penalty = dones.float()
+        if self.record_reward_terms:
+            self.last_reward_terms = {
+                "velocity_reward": velocity_reward,
+                "yaw_reward": yaw_reward,
+                "orientation_penalty": orientation_penalty,
+                "torque_penalty": torque_penalty,
+                "slip_penalty": slip_penalty,
+                "action_delta_penalty": action_delta_penalty,
+                "continuous_action_penalty": continuous_action_penalty,
+                "selector_reference_penalty": selector_reference_penalty,
+                "behavior_reference_penalty": behavior_reference_penalty,
+                "vx_abs_error_penalty": vx_abs_error_penalty,
+                "vertical_velocity_penalty": vertical_velocity_penalty,
+                "fall_penalty": fall_penalty,
+            }
+
+        return (
+            2.0 * velocity_reward
+            + 0.5 * yaw_reward
+            - orientation_penalty
+            - 0.05 * torque_penalty
+            - 0.5 * slip_penalty
+            - self.action_delta_coef * action_delta_penalty
+            - self.continuous_action_coef * continuous_action_penalty
+            - self.selector_reference_coef * selector_reference_penalty
+            - self.behavior_reference_coef * behavior_reference_penalty
+            - self.vx_abs_error_coef * vx_abs_error_penalty
+            - self.vertical_velocity_coef * vertical_velocity_penalty
+            - 10.0 * fall_penalty
+        )
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
