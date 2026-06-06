@@ -140,8 +140,24 @@ class LeggedRobot(BaseTask):
         """
         self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1.,
                                    dim=1)
+        self.edge_reset_buf = torch.zeros_like(self.reset_buf, dtype=torch.bool)
+        if getattr(self.cfg.terrain, "edge_reset_robots", False):
+            margin = getattr(self.cfg.terrain, "edge_reset_margin", self.cfg.terrain.teleport_thresh)
+            x_min = self.env_origins[:, 0] - 0.5 * self.cfg.terrain.terrain_length + margin
+            x_max = self.env_origins[:, 0] + 0.5 * self.cfg.terrain.terrain_length - margin
+            y_min = self.env_origins[:, 1] - 0.5 * self.cfg.terrain.terrain_width + margin
+            y_max = self.env_origins[:, 1] + 0.5 * self.cfg.terrain.terrain_width - margin
+            if (
+                self.cfg.terrain.terrain_length > 2.0 * margin
+                and self.cfg.terrain.terrain_width > 2.0 * margin
+            ):
+                self.edge_reset_buf = torch.logical_or(
+                    torch.logical_or(self.root_states[:, 0] < x_min, self.root_states[:, 0] > x_max),
+                    torch.logical_or(self.root_states[:, 1] < y_min, self.root_states[:, 1] > y_max),
+                )
         self.time_out_buf = self.episode_length_buf > self.cfg.env.max_episode_length  # no terminal reward for time-outs
         self.reset_buf |= self.time_out_buf
+        self.reset_buf |= self.edge_reset_buf
         if self.cfg.rewards.use_terminal_body_height:
             self.body_height_buf = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1) \
                                    < self.cfg.rewards.terminal_body_height
@@ -1019,10 +1035,27 @@ class LeggedRobot(BaseTask):
         """
         if cfg.domain_rand.push_robots:
             env_ids = env_ids[self.episode_length_buf[env_ids] % int(cfg.domain_rand.push_interval) == 0]
+            if len(env_ids) == 0:
+                return
 
             max_vel = cfg.domain_rand.max_push_vel_xy
-            self.root_states[env_ids, 7:9] = torch_rand_float(-max_vel, max_vel, (len(env_ids), 2),
-                                                              device=self.device)  # lin vel x/y
+            push_vel_xy = getattr(cfg.domain_rand, "push_vel_xy", None)
+            push_vel_xyz = getattr(cfg.domain_rand, "push_vel_xyz", None)
+            push_axis = getattr(cfg.domain_rand, "push_axis", None)
+            if push_vel_xyz is not None:
+                push = torch.tensor(push_vel_xyz, dtype=self.root_states.dtype, device=self.device)
+                self.root_states[env_ids, 7:10] = push.view(1, 3).repeat(len(env_ids), 1)
+            elif push_axis is not None:
+                signs = torch.randint(0, 2, (len(env_ids),), device=self.device, dtype=torch.float)
+                signs = signs * 2.0 - 1.0
+                self.root_states[env_ids, 7:10] = 0.0
+                self.root_states[env_ids, 7 + int(push_axis)] = signs * max_vel
+            elif push_vel_xy is None:
+                self.root_states[env_ids, 7:9] = torch_rand_float(-max_vel, max_vel, (len(env_ids), 2),
+                                                                  device=self.device)  # lin vel x/y
+            else:
+                push = torch.tensor(push_vel_xy, dtype=self.root_states.dtype, device=self.device)
+                self.root_states[env_ids, 7:9] = push.view(1, 2).repeat(len(env_ids), 1)
             self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
 
     def _teleport_robots(self, env_ids, cfg):

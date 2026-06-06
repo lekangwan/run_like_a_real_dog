@@ -23,9 +23,9 @@ def parse_vx_list(value):
     return values
 
 
-def load_high_level_model(checkpoint_path, obs_dim, action_dim, device):
+def load_high_level_model(checkpoint_path, obs_dim, num_gaits, residual_dim, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model = ActorCritic(obs_dim, action_dim).to(device)
+    model = ActorCritic(obs_dim, num_gaits, residual_dim).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     return model, int(checkpoint.get("iteration", -1))
@@ -45,6 +45,7 @@ def format_action_stats(env):
         f"offset={mapped['offset'].mean().item():.3f} "
         f"bound={mapped['bound'].mean().item():.3f} "
         f"freq={mapped['frequency'].mean().item():.3f} "
+        f"duration={mapped['duration'].mean().item():.3f} "
         f"footswing={mapped['footswing_height'].mean().item():.3f} "
         f"stance_width={mapped['stance_width'].mean().item():.3f} "
         f"body_pitch={mapped['body_pitch'].mean().item():.3f}"
@@ -71,6 +72,7 @@ def format_per_env_action_stats(env, max_envs=8):
             f"offset={mapped['offset'][i].item():.3f} "
             f"bound={mapped['bound'][i].item():.3f} "
             f"freq={mapped['frequency'][i].item():.3f} "
+            f"duration={mapped['duration'][i].item():.3f} "
             f"footswing={mapped['footswing_height'][i].item():.3f} "
             f"stance_width={mapped['stance_width'][i].item():.3f} "
             f"body_pitch={mapped['body_pitch'][i].item():.3f} "
@@ -109,7 +111,8 @@ def main():
     model, checkpoint_iteration = load_high_level_model(
         checkpoint_path,
         env.num_high_level_obs_history,
-        env.num_high_level_actions,
+        env.num_gaits,
+        env.num_behavior_actions,
         device,
     )
 

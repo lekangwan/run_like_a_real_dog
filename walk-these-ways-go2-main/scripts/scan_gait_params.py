@@ -25,6 +25,10 @@ GAIT_PARAMS = {
     "trotting": (0.5, 0.0, 0.0),
     "bounding": (0.0, 0.5, 0.0),
     "pacing": (0.0, 0.0, 0.5),
+    # Four-beat candidate: RL -> FL -> RR -> FR phase order.
+    # This is a hypothesis to validate, not a gait known to be robust in the
+    # pretrained WTW policy.
+    "walking": (0.5, 0.75, 0.0),
 }
 
 
@@ -132,7 +136,7 @@ def set_commands(env, batch, batch_size):
         commands[i, 5] = phase
         commands[i, 6] = offset
         commands[i, 7] = bound
-        commands[i, 8] = 0.5
+        commands[i, 8] = params.get("duration", 0.5)
         commands[i, 9] = params["footswing_height"]
         commands[i, 10] = params["body_pitch"]
         commands[i, 11] = 0.0

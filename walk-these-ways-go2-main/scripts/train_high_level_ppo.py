@@ -13,7 +13,8 @@ import isaacgym
 assert isaacgym
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
+import torch.nn.functional as F
+from torch.distributions import Categorical, Normal
 
 from go2_gym import MINI_GYM_ROOT_DIR
 from go2_gym.envs.base.legged_robot_config import Cfg
@@ -88,16 +89,38 @@ def load_low_level_env(logdir, num_envs, render):
     return HistoryWrapper(env)
 
 
-class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, action_dim, hidden_dims=(256, 256), init_std=0.5):
+class HybridActor(nn.Module):
+    def __init__(self, obs_dim, num_gaits, residual_dim, hidden_dims=(256, 256)):
         super().__init__()
-        actor_layers = []
+        layers = []
         last_dim = obs_dim
         for hidden_dim in hidden_dims:
-            actor_layers += [nn.Linear(last_dim, hidden_dim), nn.ELU()]
+            layers += [nn.Linear(last_dim, hidden_dim), nn.ELU()]
             last_dim = hidden_dim
-        actor_layers.append(nn.Linear(last_dim, action_dim))
-        self.actor = nn.Sequential(*actor_layers)
+        self.backbone = nn.Sequential(*layers)
+        self.gait_head = nn.Linear(last_dim, num_gaits)
+        self.residual_head = nn.Linear(last_dim, residual_dim)
+        self.num_gaits = num_gaits
+
+    def distribution_params(self, obs):
+        features = self.backbone(obs)
+        gait_logits = self.gait_head(features)
+        residual_mean = torch.tanh(self.residual_head(features))
+        return gait_logits, residual_mean
+
+    def forward(self, obs):
+        gait_logits, residual_mean = self.distribution_params(obs)
+        gait_ids = torch.argmax(gait_logits, dim=-1)
+        gait_one_hot = F.one_hot(gait_ids, num_classes=self.num_gaits).to(dtype=residual_mean.dtype)
+        return torch.cat((gait_one_hot, residual_mean), dim=-1)
+
+
+class ActorCritic(nn.Module):
+    def __init__(self, obs_dim, num_gaits, residual_dim, hidden_dims=(256, 256), init_std=0.5):
+        super().__init__()
+        self.actor = HybridActor(obs_dim, num_gaits, residual_dim, hidden_dims)
+        self.num_gaits = num_gaits
+        self.residual_dim = residual_dim
 
         critic_layers = []
         last_dim = obs_dim
@@ -107,30 +130,34 @@ class ActorCritic(nn.Module):
         critic_layers.append(nn.Linear(last_dim, 1))
         self.critic = nn.Sequential(*critic_layers)
 
-        self.log_std = nn.Parameter(torch.log(torch.ones(action_dim) * init_std))
+        self.log_std = nn.Parameter(torch.log(torch.ones(residual_dim) * init_std))
 
     def distribution(self, obs):
-        mean = torch.tanh(self.actor(obs))
-        std = torch.exp(self.log_std).expand_as(mean)
-        return Normal(mean, std)
+        gait_logits, residual_mean = self.actor.distribution_params(obs)
+        residual_std = torch.exp(self.log_std).expand_as(residual_mean)
+        return Categorical(logits=gait_logits), Normal(residual_mean, residual_std)
 
     def act(self, obs):
-        dist = self.distribution(obs)
-        action = dist.sample()
-        clipped_action = torch.clamp(action, -1.0, 1.0)
-        log_prob = dist.log_prob(clipped_action).sum(dim=-1)
+        gait_dist, residual_dist = self.distribution(obs)
+        gait_id = gait_dist.sample()
+        gait_one_hot = F.one_hot(gait_id, num_classes=self.num_gaits).to(dtype=obs.dtype)
+        residual_action = torch.clamp(residual_dist.sample(), -1.0, 1.0)
+        action = torch.cat((gait_one_hot, residual_action), dim=-1)
+        log_prob = gait_dist.log_prob(gait_id) + residual_dist.log_prob(residual_action).sum(dim=-1)
         value = self.critic(obs).squeeze(-1)
-        return clipped_action, log_prob, value
+        return action, log_prob, value
 
     def evaluate_actions(self, obs, actions):
-        dist = self.distribution(obs)
-        log_prob = dist.log_prob(actions).sum(dim=-1)
-        entropy = dist.entropy().sum(dim=-1)
+        gait_dist, residual_dist = self.distribution(obs)
+        gait_id = torch.argmax(actions[:, : self.num_gaits], dim=-1)
+        residual_action = actions[:, self.num_gaits :]
+        log_prob = gait_dist.log_prob(gait_id) + residual_dist.log_prob(residual_action).sum(dim=-1)
+        entropy = gait_dist.entropy() + residual_dist.entropy().sum(dim=-1)
         value = self.critic(obs).squeeze(-1)
         return log_prob, entropy, value
 
     def act_inference(self, obs):
-        return torch.tanh(self.actor(obs))
+        return self.actor(obs)
 
 
 class RolloutBuffer:
@@ -219,8 +246,8 @@ def append_metrics(path, row):
 def add_high_level_action_metrics(metrics, env, vx_low, vx_high, num_bins=4, compact_metrics=False):
     with torch.inference_mode():
         mapped = env._map_action(env.high_level_action)
-        target_selector_weights, target_behavior_units = env._speed_conditioned_target()
-        target_mapped = env._map_target(target_selector_weights, target_behavior_units)
+        target_selector_weights, target_residual_actions = env._speed_conditioned_target()
+        target_mapped = env._map_target(target_selector_weights, target_residual_actions)
         gait_metric_names = {
             "pronking": "pronk",
             "trotting": "trot",
@@ -232,6 +259,7 @@ def add_high_level_action_metrics(metrics, env, vx_low, vx_high, num_bins=4, com
             "offset",
             "bound",
             "frequency",
+            "duration",
             "footswing_height",
             "stance_width",
             "body_pitch",
@@ -251,6 +279,7 @@ def add_high_level_action_metrics(metrics, env, vx_low, vx_high, num_bins=4, com
             metrics["cmd_offset"] = mapped["offset"].mean().item()
             metrics["cmd_bound"] = mapped["bound"].mean().item()
             metrics["cmd_freq"] = mapped["frequency"].mean().item()
+            metrics["cmd_duration"] = mapped["duration"].mean().item()
             metrics["cmd_swing"] = mapped["footswing_height"].mean().item()
             metrics["cmd_stance"] = mapped["stance_width"].mean().item()
             metrics["cmd_pitch"] = mapped["body_pitch"].mean().item()
@@ -355,7 +384,11 @@ def main():
     env = HighLevelGaitWrapper(low_env, low_policy)
 
     device = env.device
-    model = ActorCritic(env.num_high_level_obs_history, env.num_high_level_actions).to(device)
+    model = ActorCritic(
+        env.num_high_level_obs_history,
+        env.num_gaits,
+        env.num_behavior_actions,
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     obs = env.reset()

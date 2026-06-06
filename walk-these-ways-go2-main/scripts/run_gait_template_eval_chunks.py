@@ -15,6 +15,7 @@ def grid_size(args):
         args.vx,
         args.gaits,
         args.frequencies,
+        args.durations,
         args.footswing_heights,
         args.body_pitches,
         args.stance_widths,
@@ -57,6 +58,13 @@ def merge_chunks(output_dir):
     write_csv(output_dir / "template_eval_results.csv", rows, fieldnames)
     write_csv(output_dir / "best_by_speed.csv", best_rows(rows, ["vx"]), fieldnames)
     write_csv(output_dir / "best_by_speed_gait.csv", best_rows(rows, ["vx", "gait"]), fieldnames)
+    if "condition" in fieldnames:
+        write_csv(output_dir / "best_by_condition_speed.csv", best_rows(rows, ["condition", "vx"]), fieldnames)
+        write_csv(
+            output_dir / "best_by_condition_speed_gait.csv",
+            best_rows(rows, ["condition", "vx", "gait"]),
+            fieldnames,
+        )
     return len(rows)
 
 
@@ -66,71 +74,87 @@ def main():
     parser.add_argument("--label", default="gait-conditioned-agility/pretrain-go2/train")
     parser.add_argument("--run-index", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--warmup-steps", type=int, default=80)
-    parser.add_argument("--eval-steps", type=int, default=200)
-    parser.add_argument("--chunk-configs", type=int, default=128)
-    parser.add_argument("--vx", default="0.2,0.5,0.8,1.2,1.6,2.0")
+    parser.add_argument("--warmup-steps", type=int, default=120)
+    parser.add_argument("--eval-steps", type=int, default=400)
+    parser.add_argument("--chunk-configs", type=int, default=64)
+    parser.add_argument("--vx", default="0.5,1.0,1.5,2.0")
     parser.add_argument("--gaits", default="pronking,trotting,bounding,pacing")
     parser.add_argument("--frequencies", default="2.0,2.5,3.0,3.5")
+    parser.add_argument("--durations", default="0.5")
     parser.add_argument("--footswing-heights", default="0.06,0.08,0.10")
     parser.add_argument("--body-pitches", default="-0.06,0.0")
     parser.add_argument("--stance-widths", default="0.28,0.33,0.38")
-    parser.add_argument("--output-dir", default="logs/gait_template_eval_v2_grid_chunked")
+    parser.add_argument(
+        "--conditions",
+        default="flat,ramp_up,very_low_friction,rough_mid,rough_slope,push_hard",
+    )
+    parser.add_argument("--output-dir", default="logs/gait_condition_eval_v6_selected_full")
     parser.add_argument("--log-memory", action="store_true")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
-    total = grid_size(args)
+    conditions = parse_csv_values(args.conditions)
+    per_condition_total = grid_size(args)
+    total = per_condition_total * len(conditions)
     script_path = Path(__file__).with_name("evaluate_gait_templates.py")
     print(
-        f"Running {total} configs in chunks of {args.chunk_configs}; "
+        f"Running {total} configs "
+        f"({per_condition_total} per condition x {len(conditions)} conditions) "
+        f"in chunks of {args.chunk_configs}; "
         f"output_dir={output_dir}",
         flush=True,
     )
 
-    for start in range(0, total, args.chunk_configs):
-        max_configs = min(args.chunk_configs, total - start)
-        chunk_id = start // args.chunk_configs
-        chunk_dir = output_dir / "chunks" / f"chunk_{chunk_id:04d}"
-        cmd = [
-            args.python,
-            str(script_path),
-            "--label",
-            args.label,
-            "--run-index",
-            str(args.run_index),
-            "--batch-size",
-            str(args.batch_size),
-            "--warmup-steps",
-            str(args.warmup_steps),
-            "--eval-steps",
-            str(args.eval_steps),
-            "--vx",
-            args.vx,
-            "--gaits",
-            args.gaits,
-            "--frequencies",
-            args.frequencies,
-            "--footswing-heights",
-            args.footswing_heights,
-            f"--body-pitches={args.body_pitches}",
-            "--stance-widths",
-            args.stance_widths,
-            "--start-index",
-            str(start),
-            "--max-configs",
-            str(max_configs),
-            "--output-dir",
-            str(chunk_dir),
-        ]
-        if args.log_memory:
-            cmd.append("--log-memory")
+    global_chunk_id = 0
+    for condition in conditions:
+        for start in range(0, per_condition_total, args.chunk_configs):
+            max_configs = min(args.chunk_configs, per_condition_total - start)
+            chunk_dir = output_dir / "chunks" / f"chunk_{global_chunk_id:04d}_{condition}"
+            cmd = [
+                args.python,
+                str(script_path),
+                "--label",
+                args.label,
+                "--run-index",
+                str(args.run_index),
+                "--batch-size",
+                str(args.batch_size),
+                "--warmup-steps",
+                str(args.warmup_steps),
+                "--eval-steps",
+                str(args.eval_steps),
+                "--condition",
+                condition,
+                "--vx",
+                args.vx,
+                "--gaits",
+                args.gaits,
+                "--frequencies",
+                args.frequencies,
+                "--durations",
+                args.durations,
+                "--footswing-heights",
+                args.footswing_heights,
+                f"--body-pitches={args.body_pitches}",
+                "--stance-widths",
+                args.stance_widths,
+                "--start-index",
+                str(start),
+                "--max-configs",
+                str(max_configs),
+                "--output-dir",
+                str(chunk_dir),
+            ]
+            if args.log_memory:
+                cmd.append("--log-memory")
 
-        print(
-            f"\n=== chunk {chunk_id:04d}: configs {start}:{start + max_configs}/{total} ===",
-            flush=True,
-        )
-        subprocess.run(cmd, check=True)
+            print(
+                f"\n=== chunk {global_chunk_id:04d} condition={condition}: "
+                f"configs {start}:{start + max_configs}/{per_condition_total} ===",
+                flush=True,
+            )
+            subprocess.run(cmd, check=True)
+            global_chunk_id += 1
 
     merged = merge_chunks(output_dir)
     print(f"\nMerged {merged} rows into {output_dir}", flush=True)

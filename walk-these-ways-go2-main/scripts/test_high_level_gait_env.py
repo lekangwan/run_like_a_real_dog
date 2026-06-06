@@ -18,8 +18,8 @@ from go2_gym.envs.wrappers.high_level_gait_wrapper import HighLevelGaitWrapper
 
 def parse_action(value):
     action = [float(v.strip()) for v in value.split(",") if v.strip()]
-    if len(action) != 8:
-        raise argparse.ArgumentTypeError("--action must contain 8 comma-separated values")
+    if len(action) != 9:
+        raise argparse.ArgumentTypeError("--action must contain 9 comma-separated values")
     return action
 
 
@@ -107,7 +107,7 @@ def main():
     env.set_velocity_command(args.vx, 0.0, 0.0)
 
     if args.action is None:
-        high_action = torch.zeros(args.num_envs, env.num_high_level_actions, device=env.device)
+        high_action = env.default_high_level_action.clone()
     else:
         high_action = torch.tensor(args.action, device=env.device, dtype=torch.float).repeat(args.num_envs, 1)
 

@@ -4,12 +4,13 @@ import torch
 class HighLevelGaitWrapper:
     """Wrap a WTW env + frozen low-level policy as a high-level gait-parameter env.
 
-    High-level action in [-1, 1], shape [num_envs, 8]:
-      0-3: gait selector logits for pronking/trotting/bounding/pacing
-      4: gait frequency
-      5: foot swing height
-      6: stance width
-      7: body pitch
+    High-level action shape [num_envs, 9]:
+      0-3: one-hot gait selector for pronking/trotting/bounding/pacing
+      4: residual gait frequency
+      5: residual gait duration
+      6: residual foot swing height
+      7: residual stance width
+      8: residual body pitch
     """
 
     def __init__(
@@ -21,18 +22,24 @@ class HighLevelGaitWrapper:
         action_smoothing=0.6,
         record_reward_terms=False,
         freq_range=(2.0, 3.5),
+        duration_range=(0.42, 0.58),
         phase_range=(0.0, 0.5),
         offset_range=(0.0, 0.5),
         bound_range=(0.0, 0.5),
         footswing_range=(0.04, 0.12),
         stance_width_range=(0.25, 0.38),
         body_pitch_range=(-0.10, 0.05),
+        freq_delta_range=(-0.4, 0.4),
+        duration_delta_range=(-0.08, 0.08),
+        footswing_delta_range=(-0.03, 0.03),
+        stance_width_delta_range=(-0.04, 0.04),
+        body_pitch_delta_range=(-0.04, 0.04),
         selector_temperature=0.25,
         velocity_tracking_sigma=0.25,
         vx_abs_error_coef=0.25,
         continuous_action_coef=0.03,
-        selector_reference_coef=1.0,
-        behavior_reference_coef=0.05,
+        selector_reference_coef=0.0,
+        behavior_reference_coef=0.03,
         action_delta_coef=0.05,
         vertical_velocity_coef=0.05,
     ):
@@ -48,9 +55,15 @@ class HighLevelGaitWrapper:
         self.offset_range = offset_range
         self.bound_range = bound_range
         self.freq_range = freq_range
+        self.duration_range = duration_range
         self.footswing_range = footswing_range
         self.stance_width_range = stance_width_range
         self.body_pitch_range = body_pitch_range
+        self.freq_delta_range = freq_delta_range
+        self.duration_delta_range = duration_delta_range
+        self.footswing_delta_range = footswing_delta_range
+        self.stance_width_delta_range = stance_width_delta_range
+        self.body_pitch_delta_range = body_pitch_delta_range
         self.selector_temperature = selector_temperature
         self.velocity_tracking_sigma = velocity_tracking_sigma
         self.vx_abs_error_coef = vx_abs_error_coef
@@ -73,8 +86,52 @@ class HighLevelGaitWrapper:
             device=self.device,
             dtype=torch.float,
         )
+        self.gait_behavior_templates = torch.tensor(
+            (
+                # frequency, duration, footswing_height, stance_width, body_pitch
+                (3.0, 0.5, 0.08, 0.33, 0.0),
+                (3.0, 0.5, 0.08, 0.33, 0.0),
+                (3.0, 0.5, 0.12, 0.38, 0.0),
+                (2.5, 0.5, 0.12, 0.38, 0.0),
+            ),
+            device=self.device,
+            dtype=torch.float,
+        )
+        self.residual_delta_ranges = torch.tensor(
+            (
+                self.freq_delta_range,
+                self.duration_delta_range,
+                self.footswing_delta_range,
+                self.stance_width_delta_range,
+                self.body_pitch_delta_range,
+            ),
+            device=self.device,
+            dtype=torch.float,
+        )
+        self.behavior_lows = torch.tensor(
+            (
+                self.freq_range[0],
+                self.duration_range[0],
+                self.footswing_range[0],
+                self.stance_width_range[0],
+                self.body_pitch_range[0],
+            ),
+            device=self.device,
+            dtype=torch.float,
+        )
+        self.behavior_highs = torch.tensor(
+            (
+                self.freq_range[1],
+                self.duration_range[1],
+                self.footswing_range[1],
+                self.stance_width_range[1],
+                self.body_pitch_range[1],
+            ),
+            device=self.device,
+            dtype=torch.float,
+        )
         self.num_gaits = len(self.gait_names)
-        self.num_behavior_actions = 4
+        self.num_behavior_actions = 5
         self.num_high_level_actions = self.num_gaits + self.num_behavior_actions
         self.num_high_level_obs = 40 + self.num_high_level_actions
         self.num_high_level_obs_history = self.num_high_level_obs * self.history_length
@@ -82,6 +139,8 @@ class HighLevelGaitWrapper:
         self.high_level_action = torch.zeros(
             self.num_envs, self.num_high_level_actions, device=self.device, dtype=torch.float
         )
+        self.default_high_level_action = torch.zeros_like(self.high_level_action)
+        self.default_high_level_action[:, 1] = 1.0
         self.prev_high_level_action = torch.zeros_like(self.high_level_action)
         self.velocity_command = torch.zeros(self.num_envs, 3, device=self.device, dtype=torch.float)
         self.obs_history = torch.zeros(
@@ -101,8 +160,8 @@ class HighLevelGaitWrapper:
 
     def reset(self):
         self.low_level_obs = self.env.reset()
-        self.high_level_action.zero_()
-        self.prev_high_level_action.zero_()
+        self.high_level_action.copy_(self.default_high_level_action)
+        self.prev_high_level_action.copy_(self.default_high_level_action)
         self.obs_history.zero_()
         return self.get_observations()
 
@@ -115,9 +174,10 @@ class HighLevelGaitWrapper:
     def step(self, high_level_action):
         high_level_action = torch.clip(high_level_action.to(self.device), -1.0, 1.0).detach()
         self.prev_high_level_action[:] = self.high_level_action
-        self.high_level_action[:] = (
-            self.action_smoothing * self.high_level_action
-            + (1.0 - self.action_smoothing) * high_level_action
+        self.high_level_action[:, : self.num_gaits] = self._selector_weights(high_level_action)
+        self.high_level_action[:, self.num_gaits :] = (
+            self.action_smoothing * self.high_level_action[:, self.num_gaits :]
+            + (1.0 - self.action_smoothing) * high_level_action[:, self.num_gaits :]
         )
 
         rewards = torch.zeros(self.num_envs, device=self.device)
@@ -137,6 +197,7 @@ class HighLevelGaitWrapper:
                 "behavior_reference_penalty": torch.zeros(self.num_envs, device=self.device),
                 "vx_abs_error_penalty": torch.zeros(self.num_envs, device=self.device),
                 "vertical_velocity_penalty": torch.zeros(self.num_envs, device=self.device),
+                "edge_reset": torch.zeros(self.num_envs, device=self.device),
                 "fall_penalty": torch.zeros(self.num_envs, device=self.device),
             }
 
@@ -203,7 +264,7 @@ class HighLevelGaitWrapper:
         commands[:, 5] = mapped["phase"]
         commands[:, 6] = mapped["offset"]
         commands[:, 7] = mapped["bound"]
-        commands[:, 8] = 0.5
+        commands[:, 8] = mapped["duration"]
         commands[:, 9] = mapped["footswing_height"]
         commands[:, 10] = mapped["body_pitch"]
         commands[:, 11] = 0.0
@@ -214,21 +275,37 @@ class HighLevelGaitWrapper:
     def _map_action(self, action):
         selector_weights = self._selector_weights(action)
         gait_command = selector_weights @ self.gait_templates
-        behavior_unit = 0.5 * (action[:, self.num_gaits :] + 1.0)
+        behavior_command = self._behavior_from_residual(selector_weights, action[:, self.num_gaits :])
         return {
             "selector_weights": selector_weights,
             "phase": gait_command[:, 0],
             "offset": gait_command[:, 1],
             "bound": gait_command[:, 2],
-            "frequency": self._lerp(behavior_unit[:, 0], *self.freq_range),
-            "footswing_height": self._lerp(behavior_unit[:, 1], *self.footswing_range),
-            "stance_width": self._lerp(behavior_unit[:, 2], *self.stance_width_range),
-            "body_pitch": self._lerp(behavior_unit[:, 3], *self.body_pitch_range),
+            "frequency": behavior_command[:, 0],
+            "duration": behavior_command[:, 1],
+            "footswing_height": behavior_command[:, 2],
+            "stance_width": behavior_command[:, 3],
+            "body_pitch": behavior_command[:, 4],
         }
 
     def _selector_weights(self, action):
-        logits = action[:, : self.num_gaits] / self.selector_temperature
-        return torch.softmax(logits, dim=-1)
+        gait_ids = torch.argmax(action[:, : self.num_gaits], dim=-1)
+        return torch.nn.functional.one_hot(gait_ids, num_classes=self.num_gaits).to(
+            device=self.device,
+            dtype=torch.float,
+        )
+
+    def _behavior_from_residual(self, selector_weights, residual_action):
+        base_behavior = selector_weights @ self.gait_behavior_templates
+        residual_action = torch.clamp(residual_action, -1.0, 1.0)
+        residual_unit = 0.5 * (residual_action + 1.0)
+        deltas = self._lerp(
+            residual_unit,
+            self.residual_delta_ranges[:, 0],
+            self.residual_delta_ranges[:, 1],
+        )
+        behavior = base_behavior + deltas
+        return torch.maximum(torch.minimum(behavior, self.behavior_highs), self.behavior_lows)
 
     def _speed_conditioned_target(self):
         speed = torch.clamp(torch.abs(self.env.commands[:, 0]), 0.0, 2.0)
@@ -241,33 +318,28 @@ class HighLevelGaitWrapper:
         target_selector_weights[:, 1] = 1.0 - high_speed_weight
         target_selector_weights[:, 2] = high_speed_weight
 
-        target_frequency = 2.1 + 1.1 * speed_unit
-        target_footswing = 0.05 + 0.04 * speed_unit
-        target_stance_width = 0.36 - 0.05 * speed_unit
-        target_body_pitch = -0.01 - 0.05 * speed_unit
-
-        target_behavior_units = torch.stack(
-            (
-                self._inv_lerp(target_frequency, *self.freq_range),
-                self._inv_lerp(target_footswing, *self.footswing_range),
-                self._inv_lerp(target_stance_width, *self.stance_width_range),
-                self._inv_lerp(target_body_pitch, *self.body_pitch_range),
-            ),
-            dim=-1,
+        del speed_unit
+        target_residual_actions = torch.zeros(
+            self.num_envs,
+            self.num_behavior_actions,
+            device=self.device,
+            dtype=torch.float,
         )
-        return target_selector_weights, torch.clamp(target_behavior_units, 0.0, 1.0)
+        return target_selector_weights, target_residual_actions
 
-    def _map_target(self, target_selector_weights, target_behavior_units):
+    def _map_target(self, target_selector_weights, target_residual_actions):
         gait_command = target_selector_weights @ self.gait_templates
+        behavior_command = self._behavior_from_residual(target_selector_weights, target_residual_actions)
         return {
             "selector_weights": target_selector_weights,
             "phase": gait_command[:, 0],
             "offset": gait_command[:, 1],
             "bound": gait_command[:, 2],
-            "frequency": self._lerp(target_behavior_units[:, 0], *self.freq_range),
-            "footswing_height": self._lerp(target_behavior_units[:, 1], *self.footswing_range),
-            "stance_width": self._lerp(target_behavior_units[:, 2], *self.stance_width_range),
-            "body_pitch": self._lerp(target_behavior_units[:, 3], *self.body_pitch_range),
+            "frequency": behavior_command[:, 0],
+            "duration": behavior_command[:, 1],
+            "footswing_height": behavior_command[:, 2],
+            "stance_width": behavior_command[:, 3],
+            "body_pitch": behavior_command[:, 4],
         }
 
     @staticmethod
@@ -301,18 +373,19 @@ class HighLevelGaitWrapper:
             self.high_level_action[:, self.num_gaits :] ** 2, dim=1
         )
         selector_weights = self._selector_weights(self.high_level_action)
-        target_selector_weights, target_behavior_units = self._speed_conditioned_target()
-        behavior_units = 0.5 * (self.high_level_action[:, self.num_gaits :] + 1.0)
+        target_selector_weights, target_residual_actions = self._speed_conditioned_target()
+        residual_actions = self.high_level_action[:, self.num_gaits :]
         selector_reference_penalty = torch.mean(
             (selector_weights - target_selector_weights) ** 2, dim=1
         )
         behavior_reference_penalty = torch.mean(
-            (behavior_units - target_behavior_units) ** 2, dim=1
+            (residual_actions - target_residual_actions) ** 2, dim=1
         )
         vx_abs_error_penalty = torch.abs(vx_error)
         vertical_velocity_penalty = self.env.base_lin_vel[:, 2] ** 2
 
-        fall_penalty = dones.float()
+        edge_reset = self._get_edge_reset_buf()
+        fall_penalty = (dones.bool() & ~edge_reset).float()
         if self.record_reward_terms:
             self.last_reward_terms = {
                 "velocity_reward": velocity_reward,
@@ -326,6 +399,7 @@ class HighLevelGaitWrapper:
                 "behavior_reference_penalty": behavior_reference_penalty,
                 "vx_abs_error_penalty": vx_abs_error_penalty,
                 "vertical_velocity_penalty": vertical_velocity_penalty,
+                "edge_reset": edge_reset.float(),
                 "fall_penalty": fall_penalty,
             }
 
@@ -346,3 +420,15 @@ class HighLevelGaitWrapper:
 
     def __getattr__(self, name):
         return getattr(self.env, name)
+
+    def _get_base_env(self):
+        env = self.env
+        while hasattr(env, "env"):
+            env = env.env
+        return env
+
+    def _get_edge_reset_buf(self):
+        edge_reset = getattr(self._get_base_env(), "edge_reset_buf", None)
+        if edge_reset is None:
+            return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        return edge_reset.to(device=self.device, dtype=torch.bool)

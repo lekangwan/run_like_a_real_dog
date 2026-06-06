@@ -118,10 +118,26 @@ class Terrain:
                                            vertical_scale=cfg.vertical_scale,
                                            horizontal_scale=cfg.horizontal_scale)
         slope = difficulty * 0.4
-        step_height = 0.05 + 0.18 * difficulty
-        discrete_obstacles_height = 0.05 + difficulty * (cfg.max_platform_height - 0.05)
-        stepping_stones_size = 1.5 * (1.05 - difficulty)
-        stone_distance = 0.05 if difficulty == 0 else 0.1
+        step_height = getattr(cfg, "stair_step_height", None)
+        if step_height is None:
+            step_height = 0.05 + 0.18 * difficulty
+        discrete_obstacles_height = getattr(cfg, "discrete_obstacles_height", None)
+        if discrete_obstacles_height is None:
+            discrete_obstacles_height = 0.05 + difficulty * (cfg.max_platform_height - 0.05)
+        stepping_stones_size = getattr(cfg, "stepping_stones_size", None)
+        if stepping_stones_size is None:
+            stepping_stones_size = 1.5 * (1.05 - difficulty)
+        stone_distance = getattr(cfg, "stone_distance", None)
+        if stone_distance is None:
+            stone_distance = 0.05 if difficulty == 0 else 0.1
+        stepping_stones_max_height = getattr(cfg, "stepping_stones_max_height", 0.0)
+        stepping_stones_depth = getattr(cfg, "stepping_stones_depth", -10.0)
+        ramp_slope = getattr(cfg, "ramp_slope", None)
+        if ramp_slope is not None:
+            x = np.arange(terrain.height_field_raw.shape[0], dtype=np.float32) * terrain.horizontal_scale
+            heights = ramp_slope * x
+            terrain.height_field_raw[:, :] = np.round(heights[:, None] / terrain.vertical_scale).astype(np.int16)
+            return terrain
         if choice < proportions[0]:
             if choice < proportions[0] / 2:
                 slope *= -1
@@ -141,8 +157,12 @@ class Terrain:
             terrain_utils.discrete_obstacles_terrain(terrain, discrete_obstacles_height, rectangle_min_size,
                                                      rectangle_max_size, num_rectangles, platform_size=3.)
         elif choice < proportions[5]:
+            stepping_stones_platform_size = getattr(cfg, "stepping_stones_platform_size", 4.0)
             terrain_utils.stepping_stones_terrain(terrain, stone_size=stepping_stones_size,
-                                                  stone_distance=stone_distance, max_height=0., platform_size=4.)
+                                                  stone_distance=stone_distance,
+                                                  max_height=stepping_stones_max_height,
+                                                  platform_size=stepping_stones_platform_size,
+                                                  depth=stepping_stones_depth)
         elif choice < proportions[6]:
             pass
         elif choice < proportions[7]:
@@ -170,11 +190,10 @@ class Terrain:
 
         env_origin_x = (i + 0.5) * cfg.terrain_length + cfg.x_offset * terrain.horizontal_scale
         env_origin_y = (j + 0.5) * cfg.terrain_width
-        x1 = int((cfg.terrain_length / 2. - 1) / terrain.horizontal_scale) + cfg.x_offset
-        x2 = int((cfg.terrain_length / 2. + 1) / terrain.horizontal_scale) + cfg.x_offset
+        x1 = int((cfg.terrain_length / 2. - 1) / terrain.horizontal_scale)
+        x2 = int((cfg.terrain_length / 2. + 1) / terrain.horizontal_scale)
         y1 = int((cfg.terrain_width / 2. - 1) / terrain.horizontal_scale)
         y2 = int((cfg.terrain_width / 2. + 1) / terrain.horizontal_scale)
-        env_origin_z = np.max(self.height_field_raw[start_x: end_x, start_y:end_y]) * terrain.vertical_scale
+        env_origin_z = np.max(terrain.height_field_raw[x1:x2, y1:y2]) * terrain.vertical_scale
 
         cfg.env_origins[i, j] = [env_origin_x, env_origin_y, env_origin_z]
-
