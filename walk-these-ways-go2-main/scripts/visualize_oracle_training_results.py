@@ -1,6 +1,9 @@
 import argparse
 import csv
+import os
 from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import matplotlib
 
@@ -12,8 +15,12 @@ KEY_METRICS = (
     "reward",
     "weighted_metric_reward",
     "vx_err",
+    "lateral_position_penalty",
+    "gait_switch_penalty",
+    "gait_switch_rate",
     "score_progress",
     "score_clearance",
+    "score_gait_stability",
     "score_action_smoothness",
     "score_action_magnitude",
     "score_action_boundary_margin",
@@ -39,6 +46,22 @@ TARGET_RATIO_KEYS = {
     "stepping_stones_easy_bound_highspeed": "stepping_stones_easy_bound_highspeed_bound_ratio",
 }
 
+GAIT_RATIO_KEYS = ("pronk_ratio", "trot_ratio", "bound_ratio", "pace_ratio")
+ROUTE_HEALTH_KEYS = (
+    "vx_err_mean",
+    "lateral_offset_mean",
+    "done_rate",
+    "action_clip_rate",
+    "gait_switch_rate",
+)
+ROUTE_ACTION_KEYS = (
+    "frequency_mean",
+    "duration_mean",
+    "footswing_height_mean",
+    "stance_width_mean",
+    "body_pitch_mean",
+)
+
 
 def read_metrics(path):
     rows = []
@@ -58,6 +81,22 @@ def read_metrics(path):
     return rows
 
 
+def latest_route_test_dir(run_dir):
+    route_root = Path(run_dir) / "route_tests"
+    if not route_root.exists():
+        return None
+    candidates = [
+        path
+        for path in route_root.iterdir()
+        if path.is_dir()
+        and (path / "route_summary.csv").exists()
+        and (path / "route_timeseries.csv").exists()
+    ]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda path: path.stat().st_mtime)[-1]
+
+
 def values(rows, key):
     return [row[key] for row in rows if key in row]
 
@@ -65,6 +104,12 @@ def values(rows, key):
 def mean(items):
     items = list(items)
     return sum(items) / len(items) if items else float("nan")
+
+
+def add_legend_if_present(ax):
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(loc="best", fontsize=8)
 
 
 def window_mean(rows, key, window, end=False):
@@ -78,6 +123,7 @@ def summarize(rows, window):
     for task_id in TASK_IDS:
         for suffix in (
             "action_clip_rate",
+            "gait_switch_rate",
             "footswing_height_mean",
             "frequency_mean",
             "stance_width_mean",
@@ -113,7 +159,7 @@ def plot_lines(rows, groups, output_path, title):
             ax.plot(x, values(rows, key), label=key, linewidth=1.8)
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.25)
-        ax.legend(loc="best", fontsize=8)
+        add_legend_if_present(ax)
     axes[-1].set_xlabel("iteration")
     fig.suptitle(title)
     fig.tight_layout()
@@ -165,7 +211,95 @@ def plot_compare(current_summary, baseline_summary, keys, output_path, title):
     plt.close(fig)
 
 
-def write_summary(path, run_dir, rows, summary, baseline_summary=None):
+def plot_route_summary(route_rows, output_path):
+    labels = [f"{int(row['segment'])}:{row['condition']}" for row in route_rows]
+    x = list(range(len(route_rows)))
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 11), sharex=True)
+    width = 0.18
+    for offset, key in zip((-1.5, -0.5, 0.5, 1.5), GAIT_RATIO_KEYS):
+        axes[0].bar(
+            [i + offset * width for i in x],
+            [row.get(key, 0.0) for row in route_rows],
+            width,
+            label=key,
+        )
+    axes[0].set_ylabel("gait ratio")
+    add_legend_if_present(axes[0])
+    axes[0].grid(True, axis="y", alpha=0.25)
+
+    for key in ROUTE_HEALTH_KEYS:
+        if key in route_rows[0]:
+            axes[1].plot(x, [row.get(key, 0.0) for row in route_rows], marker="o", label=key)
+    axes[1].set_ylabel("route health")
+    add_legend_if_present(axes[1])
+    axes[1].grid(True, alpha=0.25)
+
+    for key in ROUTE_ACTION_KEYS:
+        if key in route_rows[0]:
+            axes[2].plot(x, [row.get(key, 0.0) for row in route_rows], marker="o", label=key)
+    axes[2].set_ylabel("continuous actions")
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(labels, rotation=25, ha="right")
+    add_legend_if_present(axes[2])
+    axes[2].grid(True, alpha=0.25)
+
+    fig.suptitle("Route test summary")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_route_timeseries(route_rows, output_path):
+    if not route_rows:
+        return
+    fig, axes = plt.subplots(4, 1, figsize=(12, 11), sharex=True)
+    steps = values(route_rows, "step")
+
+    axes[0].plot(steps, values(route_rows, "x"), label="x", linewidth=1.7)
+    axes[0].set_ylabel("x position")
+    add_legend_if_present(axes[0])
+    axes[0].grid(True, alpha=0.25)
+
+    if "lateral_offset" in route_rows[0]:
+        axes[1].plot(steps, values(route_rows, "lateral_offset"), label="lateral_offset", linewidth=1.7)
+    axes[1].set_ylabel("lateral offset")
+    add_legend_if_present(axes[1])
+    axes[1].grid(True, alpha=0.25)
+
+    for key in ("cmd_vx", "measured_vx"):
+        if key in route_rows[0]:
+            axes[2].plot(steps, values(route_rows, key), label=key, linewidth=1.5)
+    axes[2].set_ylabel("velocity")
+    add_legend_if_present(axes[2])
+    axes[2].grid(True, alpha=0.25)
+
+    gait_to_id = {"pronking": 0, "trotting": 1, "bounding": 2, "pacing": 3}
+    if "gait" in route_rows[0]:
+        gait_ids = [gait_to_id.get(row["gait"], -1) for row in route_rows]
+        axes[3].step(steps, gait_ids, where="post", label="gait_id", linewidth=1.5)
+        axes[3].set_yticks(list(gait_to_id.values()))
+        axes[3].set_yticklabels(list(gait_to_id.keys()))
+    axes[3].set_ylabel("gait")
+    axes[3].set_xlabel("step")
+    axes[3].grid(True, alpha=0.25)
+
+    fig.suptitle("Route test timeseries")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def write_summary(
+    path,
+    run_dir,
+    rows,
+    summary,
+    baseline_summary=None,
+    route_dir=None,
+    route_summary_rows=None,
+    route_timeseries_rows=None,
+):
     lines = []
     lines.append(f"# Oracle Training Metrics Summary")
     lines.append("")
@@ -186,15 +320,19 @@ def write_summary(path, run_dir, rows, summary, baseline_summary=None):
     lines.append("")
     lines.append("## Per-Task Action Health")
     lines.append("")
-    lines.append("| task | clip early | clip late | footswing early | footswing late |")
-    lines.append("|---|---:|---:|---:|---:|")
+    lines.append("| task | clip early | clip late | switch early | switch late | footswing early | footswing late |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|")
     for task_id in TASK_IDS:
         clip_key = f"{task_id}_action_clip_rate"
+        switch_key = f"{task_id}_gait_switch_rate"
         foot_key = f"{task_id}_footswing_height_mean"
         if clip_key not in summary or foot_key not in summary:
             continue
+        switch_early = summary[switch_key]["early"] if switch_key in summary else float("nan")
+        switch_late = summary[switch_key]["late"] if switch_key in summary else float("nan")
         lines.append(
             f"| {task_id} | {summary[clip_key]['early']:.6f} | {summary[clip_key]['late']:.6f} "
+            f"| {switch_early:.6f} | {switch_late:.6f} "
             f"| {summary[foot_key]['early']:.6f} | {summary[foot_key]['late']:.6f} |"
         )
 
@@ -222,6 +360,29 @@ def write_summary(path, run_dir, rows, summary, baseline_summary=None):
             current = summary[key]["late"]
             lines.append(f"| {key} | {baseline:.6f} | {current:.6f} | {current - baseline:.6f} |")
 
+    if route_summary_rows is not None:
+        lines.append("")
+        lines.append("## Route Test")
+        lines.append("")
+        lines.append(f"- route_dir: `{route_dir}`")
+        if route_timeseries_rows is not None:
+            lines.append(f"- route steps recorded: {len(route_timeseries_rows)}")
+        lines.append("")
+        lines.append(
+            "| segment | condition | target | steps | reward | vx_err | lateral_offset | done | clip | switch | "
+            "pronk | trot | bound | pace |"
+        )
+        lines.append("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for row in route_summary_rows:
+            lines.append(
+                f"| {int(row['segment'])} | {row['condition']} | {row['target_gait']} "
+                f"| {int(row['steps'])} | {row['reward_mean']:.6f} | {row['vx_err_mean']:.6f} "
+                f"| {row.get('lateral_offset_mean', 0.0):.6f} | {row['done_rate']:.6f} "
+                f"| {row['action_clip_rate']:.6f} | {row.get('gait_switch_rate', 0.0):.6f} "
+                f"| {row['pronk_ratio']:.6f} "
+                f"| {row['trot_ratio']:.6f} | {row['bound_ratio']:.6f} | {row['pace_ratio']:.6f} |"
+            )
+
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -231,6 +392,12 @@ def main():
     parser.add_argument("--baseline-run-dir", default=None)
     parser.add_argument("--window", type=int, default=10)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument(
+        "--route-test-dir",
+        default=None,
+        help="Route-test directory containing route_summary.csv and route_timeseries.csv. Defaults to latest route_tests/*.",
+    )
+    parser.add_argument("--no-route", action="store_true")
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -246,11 +413,21 @@ def main():
         baseline_rows = read_metrics(Path(args.baseline_run_dir) / "metrics.csv")
         baseline_summary = summarize(baseline_rows, min(args.window, len(baseline_rows)))
 
+    route_dir = None
+    route_summary_rows = None
+    route_timeseries_rows = None
+    if not args.no_route:
+        route_dir = Path(args.route_test_dir) if args.route_test_dir else latest_route_test_dir(run_dir)
+        if route_dir is not None:
+            route_summary_rows = read_metrics(route_dir / "route_summary.csv")
+            route_timeseries_rows = read_metrics(route_dir / "route_timeseries.csv")
+
     plot_lines(
         rows,
         (
             ("reward", ("reward", "weighted_metric_reward")),
-            ("tracking", ("vx_err", "score_progress")),
+            ("tracking", ("vx_err", "score_progress", "lateral_position_penalty")),
+            ("gait stability", ("gait_switch_rate", "gait_switch_penalty", "score_gait_stability")),
             ("clearance/action", ("score_clearance", "footswing_height_mean", "action_clip_rate")),
             (
                 "action health",
@@ -265,6 +442,7 @@ def main():
         (
             ("global gait ratios", ("gait_pronk_ratio", "gait_trot_ratio", "gait_bound_ratio", "gait_pace_ratio")),
             ("task target ratios", tuple(TARGET_RATIO_KEYS.values())),
+            ("per-task switch rate", tuple(f"{task}_gait_switch_rate" for task in TASK_IDS)),
         ),
         output_dir / "gait_ratios.png",
         "Gait selection ratios",
@@ -293,8 +471,21 @@ def main():
             output_dir / "baseline_compare_key_metrics.png",
             "Baseline late vs current late",
         )
+    if route_summary_rows is not None:
+        plot_route_summary(route_summary_rows, output_dir / "route_summary.png")
+    if route_timeseries_rows is not None:
+        plot_route_timeseries(route_timeseries_rows, output_dir / "route_timeseries.png")
 
-    write_summary(output_dir / "summary.md", run_dir, rows, summary, baseline_summary)
+    write_summary(
+        output_dir / "summary.md",
+        run_dir,
+        rows,
+        summary,
+        baseline_summary,
+        route_dir,
+        route_summary_rows,
+        route_timeseries_rows,
+    )
     print(f"Wrote analysis to: {output_dir}")
     print(f"Summary: {output_dir / 'summary.md'}")
 

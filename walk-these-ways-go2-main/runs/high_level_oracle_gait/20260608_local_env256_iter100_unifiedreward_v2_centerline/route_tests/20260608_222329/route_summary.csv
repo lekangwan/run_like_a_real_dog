@@ -1,0 +1,6 @@
+segment,task_id,condition,target_gait,cmd_vx,steps,reward_mean,done_rate,vx_err_mean,lateral_offset_mean,action_clip_rate,frequency_mean,duration_mean,footswing_height_mean,stance_width_mean,body_pitch_mean,pronk_ratio,trot_ratio,bound_ratio,pace_ratio
+0,flat_trot_efficiency,flat,trotting,1.0,80,0.7301036335527897,0.0,0.18241800740361214,0.4148853808641434,0.0,2.833655646443367,0.5106656987220048,0.09968929118476808,0.35269346721470357,-0.003591593005694449,0.2125,0.2375,0.2875,0.2625
+1,ramp_up_trot_robustness,ramp_up,trotting,1.0,40,0.6704003341495991,0.025,0.2373465210199356,2.5952359676361083,0.0,2.898179405927658,0.5162780150771141,0.09524336876347661,0.34702088534832,-0.008647819189354778,0.325,0.25,0.225,0.2
+2,rough_slope_trot_robustness,rough_slope,trotting,1.0,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+3,push_lateral_pace_recovery,push_lateral,pacing,1.5,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+4,stepping_stones_easy_bound_highspeed,stepping_stones_easy,bounding,2.0,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0

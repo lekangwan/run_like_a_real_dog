@@ -52,9 +52,11 @@ BASE_METRIC_WEIGHTS = {
     "progress": 1.0,
     "yaw_tracking": 0.3,
     "orientation": 0.3,
-    "action_smoothness": 0.5,
-    "action_magnitude": 0.3,
-    "action_boundary_margin": 0.4,
+    "lateral_drift": 0.8,
+    "gait_stability": 0.4,
+    "action_smoothness": 0.7,
+    "action_magnitude": 0.6,
+    "action_boundary_margin": 0.8,
     "survival": 2.0,
 }
 TASK_REWARD_FOCUS_WEIGHTS = {
@@ -333,20 +335,34 @@ def add_gait_metrics(metrics, env, actions):
     if actions.shape[0] % env.num_envs != 0:
         raise ValueError(f"Expected actions to be a multiple of num_envs={env.num_envs}")
     repeats = actions.shape[0] // env.num_envs
+    action_seq = actions.reshape(repeats, env.num_envs, -1)
+    gait_seq = torch.argmax(action_seq[:, :, : env.num_gaits], dim=-1)
     task_ids = env.assignment.task_ids.repeat(repeats)
     last_actions = actions[-env.num_envs :]
 
     for gait_id, gait_name in enumerate(GAIT_NAMES):
         metrics[f"gait_{GAIT_SHORT_NAMES[gait_name]}_ratio"] = (gait_ids == gait_id).float().mean().item()
 
+    if repeats > 1:
+        switch_seq = (gait_seq[1:] != gait_seq[:-1]).float()
+        metrics["gait_switch_rate"] = switch_seq.mean().item()
+    else:
+        switch_seq = None
+        metrics["gait_switch_rate"] = 0.0
+
     for task_index, spec in enumerate(env.specs):
         mask = task_ids == task_index
         task_gait_ids = gait_ids[mask]
+        env_mask = env.assignment.task_ids == task_index
         short_target = GAIT_SHORT_NAMES[spec.target_gait]
         metrics[f"{spec.task_id}_{short_target}_ratio"] = (
             task_gait_ids == spec.target_gait_id
         ).float().mean().item()
         metrics[f"{spec.task_id}_count"] = int(mask.sum().item() / repeats)
+        if switch_seq is not None and torch.any(env_mask):
+            metrics[f"{spec.task_id}_gait_switch_rate"] = switch_seq[:, env_mask].mean().item()
+        else:
+            metrics[f"{spec.task_id}_gait_switch_rate"] = 0.0
         for gait_id, gait_name in enumerate(GAIT_NAMES):
             metrics[f"{spec.task_id}_{GAIT_SHORT_NAMES[gait_name]}_ratio"] = (
                 task_gait_ids == gait_id
@@ -468,15 +484,20 @@ def main():
         orientation_penalty_sum = 0.0
         slip_penalty_sum = 0.0
         lateral_velocity_penalty_sum = 0.0
+        lateral_position_penalty_sum = 0.0
         clearance_reward_sum = 0.0
+        gait_switch_penalty_sum = 0.0
         action_boundary_penalty_sum = 0.0
         metric_score_sums = {name: 0.0 for name in HighLevelGaitWrapper.TASK_REWARD_NAMES}
+        actual_actions = []
 
         for _ in range(args.num_steps):
             with torch.inference_mode():
                 action, log_prob, value = model.act(obs)
                 next_obs, reward, done, info = env.step(action)
             buffer.add(obs, action, log_prob, reward, done, value)
+            executed_action = info.get("executed_high_level_action", env.env.high_level_action)
+            actual_actions.append(executed_action.detach().clone())
             reward_sum += reward.mean().item()
             done_sum += done.float().mean().item()
             terms = info.get("high_level_reward_terms", {})
@@ -492,8 +513,12 @@ def main():
                 slip_penalty_sum += terms["slip_penalty"].mean().item()
             if "lateral_velocity_penalty" in terms:
                 lateral_velocity_penalty_sum += terms["lateral_velocity_penalty"].mean().item()
+            if "lateral_position_penalty" in terms:
+                lateral_position_penalty_sum += terms["lateral_position_penalty"].mean().item()
             if "clearance_reward" in terms:
                 clearance_reward_sum += terms["clearance_reward"].mean().item()
+            if "gait_switch_penalty" in terms:
+                gait_switch_penalty_sum += terms["gait_switch_penalty"].mean().item()
             if "action_boundary_penalty" in terms:
                 action_boundary_penalty_sum += terms["action_boundary_penalty"].mean().item()
             for name in HighLevelGaitWrapper.TASK_REWARD_NAMES:
@@ -508,6 +533,7 @@ def main():
         buffer.compute_returns(last_value, args.gamma, args.lam)
 
         flat_obs, flat_actions, flat_log_probs, flat_returns, flat_advantages, _ = buffer.flat()
+        actual_actions_flat = torch.stack(actual_actions, dim=0).reshape(-1, env.num_high_level_actions)
         batch_size = flat_obs.shape[0]
         mini_batch_size = max(1, batch_size // args.mini_batches)
 
@@ -550,7 +576,9 @@ def main():
             "orientation_penalty": orientation_penalty_sum / args.num_steps,
             "slip_penalty": slip_penalty_sum / args.num_steps,
             "lateral_velocity_penalty": lateral_velocity_penalty_sum / args.num_steps,
+            "lateral_position_penalty": lateral_position_penalty_sum / args.num_steps,
             "clearance_reward": clearance_reward_sum / args.num_steps,
+            "gait_switch_penalty": gait_switch_penalty_sum / args.num_steps,
             "action_boundary_penalty": action_boundary_penalty_sum / args.num_steps,
             "policy_loss": policy_loss_epoch / updates,
             "value_loss": value_loss_epoch / updates,
@@ -559,7 +587,7 @@ def main():
         }
         for name, value in metric_score_sums.items():
             metrics[f"score_{name}"] = value / args.num_steps
-        add_gait_metrics(metrics, env, flat_actions.detach())
+        add_gait_metrics(metrics, env, actual_actions_flat.detach())
         append_metrics(metrics_path, metrics)
 
         if iteration % args.save_interval == 0 or iteration == args.iterations - 1:
@@ -569,13 +597,15 @@ def main():
             f"iter={iteration:04d} reward={metrics['reward']:.3f} "
             f"done={metrics['done_rate']:.3f} edge={metrics['edge_reset_rate']:.3f} "
             f"vx_err={metrics['vx_err']:.3f} "
+            f"lat_pos={metrics['lateral_position_penalty']:.3f} "
+            f"switch={metrics['gait_switch_rate']:.3f} "
             f"metric={metrics['weighted_metric_reward']:.3f} "
             f"flat_trot={metrics.get('flat_trot_efficiency_trot_ratio', float('nan')):.2f} "
             f"push_pace={metrics.get('push_lateral_pace_recovery_pace_ratio', float('nan')):.2f} "
             f"stone_bound={metrics.get('stepping_stones_easy_bound_highspeed_bound_ratio', float('nan')):.2f}"
         )
 
-        del buffer, flat_obs, flat_actions, flat_log_probs, flat_returns, flat_advantages
+        del buffer, flat_obs, flat_actions, flat_log_probs, flat_returns, flat_advantages, actual_actions_flat, actual_actions
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.synchronize(device)

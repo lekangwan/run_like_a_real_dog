@@ -25,6 +25,7 @@ class HighLevelGaitWrapper:
         "slip",
         "energy",
         "clearance",
+        "gait_stability",
         "action_smoothness",
         "action_magnitude",
         "action_boundary_margin",
@@ -53,6 +54,7 @@ class HighLevelGaitWrapper:
         stance_width_delta_range=(-0.04, 0.04),
         body_pitch_delta_range=(-0.04, 0.04),
         selector_temperature=0.25,
+        selector_hold_steps=3,
         velocity_tracking_sigma=0.25,
         selector_reference_coef=0.0,
     ):
@@ -78,6 +80,7 @@ class HighLevelGaitWrapper:
         self.stance_width_delta_range = stance_width_delta_range
         self.body_pitch_delta_range = body_pitch_delta_range
         self.selector_temperature = selector_temperature
+        self.selector_hold_steps = max(1, int(selector_hold_steps))
         self.velocity_tracking_sigma = velocity_tracking_sigma
         self.selector_reference_coef = selector_reference_coef
 
@@ -141,7 +144,7 @@ class HighLevelGaitWrapper:
         self.num_gaits = len(self.gait_names)
         self.num_behavior_actions = 5
         self.num_high_level_actions = self.num_gaits + self.num_behavior_actions
-        self.num_high_level_obs = 40 + self.num_high_level_actions
+        self.num_high_level_obs = 42 + self.num_high_level_actions
         self.num_high_level_obs_history = self.num_high_level_obs * self.history_length
 
         self.high_level_action = torch.zeros(
@@ -150,6 +153,12 @@ class HighLevelGaitWrapper:
         self.default_high_level_action = torch.zeros_like(self.high_level_action)
         self.default_high_level_action[:, 1] = 1.0
         self.prev_high_level_action = torch.zeros_like(self.high_level_action)
+        self.selector_hold_counter = torch.full(
+            (self.num_envs,),
+            self.selector_hold_steps,
+            device=self.device,
+            dtype=torch.long,
+        )
         self.velocity_command = torch.zeros(self.num_envs, 3, device=self.device, dtype=torch.float)
         self.obs_history = torch.zeros(
             self.num_envs,
@@ -173,6 +182,7 @@ class HighLevelGaitWrapper:
         self.low_level_obs = self.env.reset()
         self.high_level_action.copy_(self.default_high_level_action)
         self.prev_high_level_action.copy_(self.default_high_level_action)
+        self.selector_hold_counter.fill_(self.selector_hold_steps)
         self.obs_history.zero_()
         return self.get_observations()
 
@@ -201,7 +211,7 @@ class HighLevelGaitWrapper:
     def step(self, high_level_action):
         high_level_action = torch.clip(high_level_action.to(self.device), -1.0, 1.0).detach()
         self.prev_high_level_action[:] = self.high_level_action
-        self.high_level_action[:, : self.num_gaits] = self._selector_weights(high_level_action)
+        self.high_level_action[:, : self.num_gaits] = self._held_selector_weights(high_level_action)
         self.high_level_action[:, self.num_gaits :] = (
             self.action_smoothing * self.high_level_action[:, self.num_gaits :]
             + (1.0 - self.action_smoothing) * high_level_action[:, self.num_gaits :]
@@ -225,10 +235,12 @@ class HighLevelGaitWrapper:
                 "behavior_reference_penalty": torch.zeros(self.num_envs, device=self.device),
                 "vertical_velocity_penalty": torch.zeros(self.num_envs, device=self.device),
                 "lateral_velocity_penalty": torch.zeros(self.num_envs, device=self.device),
+                "lateral_position_penalty": torch.zeros(self.num_envs, device=self.device),
                 "roll_rate_penalty": torch.zeros(self.num_envs, device=self.device),
                 "pitch_rate_penalty": torch.zeros(self.num_envs, device=self.device),
                 "yaw_rate_penalty": torch.zeros(self.num_envs, device=self.device),
                 "clearance_reward": torch.zeros(self.num_envs, device=self.device),
+                "gait_switch_penalty": torch.zeros(self.num_envs, device=self.device),
                 "weighted_metric_reward": torch.zeros(self.num_envs, device=self.device),
                 "edge_reset": torch.zeros(self.num_envs, device=self.device),
                 "fall_penalty": torch.zeros(self.num_envs, device=self.device),
@@ -247,6 +259,13 @@ class HighLevelGaitWrapper:
                     reward_terms[key] += value
             dones_accum |= dones.bool()
             del low_action
+
+        info["executed_high_level_action"] = self.high_level_action.detach().clone()
+        if torch.any(dones_accum):
+            done_ids = dones_accum.nonzero(as_tuple=False).flatten()
+            self.high_level_action[done_ids] = self.default_high_level_action[done_ids]
+            self.prev_high_level_action[done_ids] = self.default_high_level_action[done_ids]
+            self.selector_hold_counter[done_ids] = self.selector_hold_steps
 
         rewards /= self.low_level_steps
         if self.record_reward_terms:
@@ -275,6 +294,9 @@ class HighLevelGaitWrapper:
         ]
         dof_vel = self.env.dof_vel[:, : self.env.num_actuated_dof]
         contact_state = (self.env.contact_forces[:, self.env.feet_indices, 2] > 1.0).float()
+        lateral_offset = self._compute_lateral_offset()
+        lateral_offset_obs = torch.clamp(lateral_offset / 2.0, -2.0, 2.0).unsqueeze(1)
+        lateral_offset_abs_obs = torch.clamp(torch.abs(lateral_offset) / 2.0, 0.0, 2.0).unsqueeze(1)
         obs = torch.cat(
             (
                 velocity_error,
@@ -284,6 +306,8 @@ class HighLevelGaitWrapper:
                 dof_pos_error,
                 dof_vel,
                 contact_state,
+                lateral_offset_obs,
+                lateral_offset_abs_obs,
                 self.high_level_action,
             ),
             dim=-1,
@@ -326,6 +350,22 @@ class HighLevelGaitWrapper:
     def _selector_weights(self, action):
         gait_ids = torch.argmax(action[:, : self.num_gaits], dim=-1)
         return torch.nn.functional.one_hot(gait_ids, num_classes=self.num_gaits).to(
+            device=self.device,
+            dtype=torch.float,
+        )
+
+    def _held_selector_weights(self, requested_action):
+        requested_ids = torch.argmax(requested_action[:, : self.num_gaits], dim=-1)
+        current_ids = torch.argmax(self.high_level_action[:, : self.num_gaits], dim=-1)
+        can_switch = self.selector_hold_counter >= self.selector_hold_steps
+        should_switch = can_switch & (requested_ids != current_ids)
+        selected_ids = torch.where(should_switch, requested_ids, current_ids)
+        self.selector_hold_counter = torch.where(
+            should_switch,
+            torch.zeros_like(self.selector_hold_counter),
+            self.selector_hold_counter + 1,
+        )
+        return torch.nn.functional.one_hot(selected_ids, num_classes=self.num_gaits).to(
             device=self.device,
             dtype=torch.float,
         )
@@ -426,6 +466,11 @@ class HighLevelGaitWrapper:
             dim=1,
         )
         selector_weights = self._selector_weights(self.high_level_action)
+        prev_selector_weights = self._selector_weights(self.prev_high_level_action)
+        gait_switch_penalty = torch.mean(
+            (selector_weights - prev_selector_weights) ** 2,
+            dim=1,
+        )
         target_selector_weights, target_residual_actions = self._speed_conditioned_target()
         residual_actions = self.high_level_action[:, self.num_gaits :]
         selector_reference_penalty = torch.mean(
@@ -436,6 +481,7 @@ class HighLevelGaitWrapper:
         )
         vertical_velocity_penalty = self.env.base_lin_vel[:, 2] ** 2
         lateral_velocity_penalty = self.env.base_lin_vel[:, 1] ** 2
+        lateral_position_penalty = self._compute_lateral_position_penalty()
         roll_rate_penalty = self.env.base_ang_vel[:, 0] ** 2
         pitch_rate_penalty = self.env.base_ang_vel[:, 1] ** 2
         yaw_rate_penalty = self.env.base_ang_vel[:, 2] ** 2
@@ -458,10 +504,12 @@ class HighLevelGaitWrapper:
             roll_rate_penalty=roll_rate_penalty,
             yaw_rate_penalty=yaw_rate_penalty,
             lateral_velocity_penalty=lateral_velocity_penalty,
+            lateral_position_penalty=lateral_position_penalty,
             vertical_velocity_penalty=vertical_velocity_penalty,
             slip_penalty=slip_penalty,
             torque_penalty=torque_penalty,
             clearance_reward=clearance_reward,
+            gait_switch_penalty=gait_switch_penalty,
             action_delta_penalty=action_delta_penalty,
             continuous_action_penalty=continuous_action_penalty,
             action_boundary_penalty=action_boundary_penalty,
@@ -482,10 +530,12 @@ class HighLevelGaitWrapper:
                 "behavior_reference_penalty": behavior_reference_penalty,
                 "vertical_velocity_penalty": vertical_velocity_penalty,
                 "lateral_velocity_penalty": lateral_velocity_penalty,
+                "lateral_position_penalty": lateral_position_penalty,
                 "roll_rate_penalty": roll_rate_penalty,
                 "pitch_rate_penalty": pitch_rate_penalty,
                 "yaw_rate_penalty": yaw_rate_penalty,
                 "clearance_reward": clearance_reward,
+                "gait_switch_penalty": gait_switch_penalty,
                 "weighted_metric_reward": weighted_metric_reward,
                 "edge_reset": edge_reset.float(),
                 "fall_penalty": fall_penalty,
@@ -504,10 +554,12 @@ class HighLevelGaitWrapper:
         roll_rate_penalty,
         yaw_rate_penalty,
         lateral_velocity_penalty,
+        lateral_position_penalty,
         vertical_velocity_penalty,
         slip_penalty,
         torque_penalty,
         clearance_reward,
+        gait_switch_penalty,
         action_delta_penalty,
         continuous_action_penalty,
         action_boundary_penalty,
@@ -521,11 +573,12 @@ class HighLevelGaitWrapper:
                 torch.exp(-pitch_rate_penalty / 0.25),
                 torch.exp(-roll_rate_penalty / 0.25),
                 torch.exp(-yaw_rate_penalty / 0.25),
-                torch.exp(-lateral_velocity_penalty / 0.05),
+                torch.exp(-lateral_velocity_penalty / 0.05 - lateral_position_penalty / 1.00),
                 torch.exp(-vertical_velocity_penalty / 0.05),
                 torch.exp(-slip_penalty / 0.05),
                 torch.exp(-torque_penalty / 0.50),
                 clearance_reward,
+                torch.exp(-gait_switch_penalty / 0.25),
                 torch.exp(-action_delta_penalty / 0.05),
                 torch.exp(-continuous_action_penalty / 0.25),
                 torch.exp(-action_boundary_penalty / 0.25),
@@ -548,6 +601,17 @@ class HighLevelGaitWrapper:
         while hasattr(env, "env"):
             env = env.env
         return env
+
+    def _compute_lateral_position_penalty(self):
+        lateral_offset = self._compute_lateral_offset()
+        return torch.clamp(torch.abs(lateral_offset) - 0.25, min=0.0) ** 2
+
+    def _compute_lateral_offset(self):
+        base_env = self._get_base_env()
+        env_origins = getattr(base_env, "env_origins", None)
+        if env_origins is None:
+            return base_env.root_states[: self.num_envs, 1]
+        return base_env.root_states[: self.num_envs, 1] - env_origins[: self.num_envs, 1]
 
     def _get_edge_reset_buf(self):
         edge_reset = getattr(self._get_base_env(), "edge_reset_buf", None)

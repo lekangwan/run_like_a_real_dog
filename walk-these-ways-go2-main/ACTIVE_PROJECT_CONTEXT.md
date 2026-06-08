@@ -97,6 +97,7 @@ scripts/play_oracle_policy_training_map.py
                                          learned oracle policy visualization
 scripts/visualize_oracle_training_results.py
                                          metrics plots and summary for oracle runs
+scripts/test_oracle_policy_route.py     route-style multi-terrain policy test
 scripts/evaluate_gait_templates.py      fixed-template evaluation helpers
 scripts/play_task_gait_oracle.py        fixed-template single-scene playback
 scripts/play_training_scenes_oracle.py  fixed-template active-scene playback
@@ -161,10 +162,15 @@ derived from `reward_focus` in the task map. `--style-reward-scale` defaults to
 `0.0`, so target gait labels are logged for analysis but are not used as hard
 selector rewards unless explicitly enabled.
 
-The shared base weights include progress, yaw tracking, orientation, action
-smoothness, action magnitude, action boundary margin, and survival. Clearance
-is intentionally weak because it is currently a foot-swing command proxy, not a
-direct terrain-relative scuffing measurement.
+The shared base weights include progress, yaw tracking, orientation, lateral
+drift, gait stability, action smoothness, action magnitude, action boundary
+margin, and survival. The lateral-drift score combines lateral velocity with
+body offset from the terrain patch centerline, and the high-level observation
+history now includes signed and absolute lateral centerline offset. A
+selector-hold mechanism and gait-switch penalty were added after v2 showed
+frequent within-scene gait switching. Clearance is intentionally weak because it
+is currently a foot-swing command proxy, not a direct terrain-relative scuffing
+measurement.
 
 It uses one IsaacGym sim with mixed envs. Each env is assigned one of the active
 training tasks, including terrain type, push setting, target gait, style reward
@@ -177,13 +183,27 @@ This is an oracle-condition sanity check:
 - output = categorical gait choice + continuous residual parameters
 - PPO and actor-critic implementation are reused from `scripts/train_high_level_ppo.py`
 
+Current v3 observation dimensions are:
+
+```text
+base high-level observation history: 510
+task one-hot: 5
+oracle observation: 515
+```
+
+Old v0-v2 checkpoints used 495-D oracle observations and are not compatible with
+the v3 model architecture.
+
 If oracle-condition training cannot separate the target gaits, do not train the
 final proprioception-only version yet; fix reward/scene design first.
 
 The first 100-iteration oracle run showed a reward-design warning: foot swing
-height increased, but progress and action health slightly worsened. Do not start
-long training until a local 100-iteration run improves progress/action metrics
-without pushing continuous actions toward the bounds.
+height increased, but progress and action health slightly worsened. v2 added a
+centerline reward, but metrics and route visualization still worsened because
+the policy did not observe its lateral offset and gait selection switched too
+frequently inside one scene. The next local run should be v3, validating
+centerline-offset observations plus gait-stability reward/selector hold. Do not
+start long training until this local validation is healthy.
 
 After each local training run, visualize the latest checkpoint on the mixed
 training map:

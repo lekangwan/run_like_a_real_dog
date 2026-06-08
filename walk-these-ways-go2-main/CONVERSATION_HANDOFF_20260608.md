@@ -56,6 +56,7 @@ train_high_level_ppo.py
 train_high_level_oracle_ppo.py
 play_oracle_policy_training_map.py
 visualize_oracle_training_results.py
+test_oracle_policy_route.py
 evaluate_gait_templates.py
 play_task_gait_oracle.py
 play_training_scenes_oracle.py
@@ -113,14 +114,18 @@ proprioceptive history + task one-hot
 Current observation dimensions:
 
 ```text
-base high-level observation history: 490
+base high-level observation history: 510
 task one-hot: 5
-oracle observation: 495
+oracle observation: 515
 ```
 
 The task one-hot is temporary. It is used only for sanity checking that the
 reward and scenes are learnable. The final version should remove the task label
 and rely on proprioception/history.
+
+Important compatibility note: v3 adds signed and absolute lateral centerline
+offset to each high-level observation frame, so old v0-v2 checkpoints with
+495-D oracle observations cannot be loaded into the new 515-D model.
 
 ## Active Training Scenes
 
@@ -196,6 +201,7 @@ vertical_bounce
 slip
 energy
 clearance
+gait_stability
 action_smoothness
 action_magnitude
 action_boundary_margin
@@ -209,9 +215,11 @@ BASE_METRIC_WEIGHTS = {
     "progress": 1.0,
     "yaw_tracking": 0.3,
     "orientation": 0.3,
-    "action_smoothness": 0.5,
-    "action_magnitude": 0.3,
-    "action_boundary_margin": 0.4,
+    "lateral_drift": 0.8,
+    "gait_stability": 0.4,
+    "action_smoothness": 0.7,
+    "action_magnitude": 0.6,
+    "action_boundary_margin": 0.8,
     "survival": 2.0,
 }
 ```
@@ -238,6 +246,19 @@ Condition-specific additions are read from `reward_focus` in the task map:
 Important caveat: current `clearance` is still a foot-swing command proxy, not a
 true terrain-relative foot scuffing measurement. This is why its weight was
 reduced after the first 100-iteration run.
+
+After v1 visualization, the robot showed severe lateral offset and could fall
+off the side before reaching the second route segment. v2 added a centerline
+penalty and raised lateral/action-health weights, but v2 still worsened several
+training metrics and showed frequent within-scene gait switching. The current
+v3 fix is mechanism-level rather than only weight-level:
+
+- add signed and absolute lateral centerline offset into high-level observations,
+- add `gait_stability` and `gait_switch_penalty`,
+- apply a short selector hold so the executed gait cannot flip every high-level
+  step,
+- log gait ratios, clip rate, and switch rate from the actually executed
+  smoothed/held high-level action.
 
 The final reward is:
 
@@ -359,14 +380,15 @@ Use `--no-render` only for quick script checks.
 
 ## Next Immediate Step
 
-Run a new local 100-iteration sanity check with the corrected reward:
+Run a new local 100-iteration sanity check with centerline observations and gait
+stability:
 
 ```bash
 cd /home/lekangwan/run_like_a_real_dog/walk-these-ways-go2-main
 conda activate go2_wtw
 
 CUDA_VISIBLE_DEVICES=0 python3 scripts/train_high_level_oracle_ppo.py \
-  --run-name 20260608_local_env256_iter100_unifiedreward_v1 \
+  --run-name 20260608_local_env256_iter100_unifiedreward_v3_centerline_obs_switch \
   --num-envs 256 \
   --num-steps 32 \
   --iterations 100 \
@@ -383,26 +405,49 @@ After it finishes:
    - `reward`
    - `weighted_metric_reward`
    - `vx_err`
+   - `lateral_position_penalty`
+   - `gait_switch_rate`
+   - `gait_switch_penalty`
    - `score_progress`
    - `score_clearance`
+   - `score_gait_stability`
    - `score_action_smoothness`
    - `score_action_magnitude`
    - `score_action_boundary_margin`
    - `action_clip_rate`
    - per-task `*_footswing_height_mean`
    - per-task `*_action_clip_rate`
+   - per-task `*_gait_switch_rate`
 3. Run visualization:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python3 scripts/play_oracle_policy_training_map.py \
-  --run-dir runs/high_level_oracle_gait/20260608_local_env256_iter100_unifiedreward_v1 \
+  --run-dir runs/high_level_oracle_gait/20260608_local_env256_iter100_unifiedreward_v3_centerline_obs_switch \
   --num-envs-per-task 4 \
   --steps 2000 \
   --print-interval 200
 ```
 
-Do not run 1000 iterations or server overnight training until v1 shows healthier
-learning than v0.
+Then run the route-style test:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 scripts/test_oracle_policy_route.py \
+  --run-dir runs/high_level_oracle_gait/20260608_local_env256_iter100_unifiedreward_v3_centerline_obs_switch \
+  --segment-length 8.0 \
+  --max-steps 5000 \
+  --print-interval 100
+```
+
+Then generate plots and summary:
+
+```bash
+python3 scripts/visualize_oracle_training_results.py \
+  --run-dir runs/high_level_oracle_gait/20260608_local_env256_iter100_unifiedreward_v3_centerline_obs_switch \
+  --baseline-run-dir runs/high_level_oracle_gait/20260608_local_env256_iter100_unifiedreward_v2_centerline
+```
+
+Do not run 1000 iterations or server overnight training until v3 shows healthier
+centerline tracking, action health, and gait-switch stability than v2.
 
 ## Environment Notes
 
@@ -484,6 +529,7 @@ Important runtime quirks:
   old scan/comparison scripts unless explicitly restoring historical tooling.
 - Do not assume target gait labels are hard rewards; default style scale is 0.
 - Do not start long training just because a short run completes.
-- The next job is v1 local 100-iteration validation.
+- The next job is v3 local 100-iteration validation with centerline-offset
+  observations and gait-switch stability.
 - The success criterion is healthier metrics and visual behavior, not just a
   slightly higher scalar reward.
