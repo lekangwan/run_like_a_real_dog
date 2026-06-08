@@ -9,7 +9,8 @@ import pandas as pd
 import torch
 
 from evaluate_gait_templates import build_command_tensor, load_env, set_commands
-from scan_gait_params import find_logdir, load_policy
+from gait_project_config import MAINLINE_TEMPLATE_LIBRARY
+from train_high_level_ppo import find_logdir, load_low_level_policy as load_policy
 
 
 def parse_floats(value):
@@ -98,7 +99,7 @@ def main():
     parser.add_argument("--run-index", type=int, default=0)
     parser.add_argument(
         "--library",
-        default="logs/gait_condition_eval_v8_mainline/gait_template_library/gait_template_library.csv",
+        default=str(MAINLINE_TEMPLATE_LIBRARY),
     )
     parser.add_argument("--task-id", default="flat_trot_efficiency")
     parser.add_argument("--condition", default=None)
@@ -119,7 +120,7 @@ def main():
     if not library_path.exists():
         raise FileNotFoundError(
             f"Template library not found: {library_path}. "
-            "Run scripts/build_gait_template_library.py first."
+            "Check logs/gait_condition_eval_v8_mainline or pass --library."
         )
     library = pd.read_csv(library_path)
     args.condition = infer_condition(library, args.task_id, args.condition)

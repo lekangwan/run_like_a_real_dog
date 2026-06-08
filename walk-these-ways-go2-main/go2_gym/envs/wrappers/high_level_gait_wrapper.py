@@ -13,6 +13,24 @@ class HighLevelGaitWrapper:
       8: residual body pitch
     """
 
+    TASK_REWARD_NAMES = (
+        "progress",
+        "yaw_tracking",
+        "orientation",
+        "pitch_rate",
+        "roll_rate",
+        "yaw_rate",
+        "lateral_drift",
+        "vertical_bounce",
+        "slip",
+        "energy",
+        "clearance",
+        "action_smoothness",
+        "action_magnitude",
+        "action_boundary_margin",
+        "survival",
+    )
+
     def __init__(
         self,
         env,
@@ -36,12 +54,7 @@ class HighLevelGaitWrapper:
         body_pitch_delta_range=(-0.04, 0.04),
         selector_temperature=0.25,
         velocity_tracking_sigma=0.25,
-        vx_abs_error_coef=0.25,
-        continuous_action_coef=0.03,
         selector_reference_coef=0.0,
-        behavior_reference_coef=0.03,
-        action_delta_coef=0.05,
-        vertical_velocity_coef=0.05,
     ):
         self.env = env
         self.low_level_policy = low_level_policy
@@ -66,12 +79,7 @@ class HighLevelGaitWrapper:
         self.body_pitch_delta_range = body_pitch_delta_range
         self.selector_temperature = selector_temperature
         self.velocity_tracking_sigma = velocity_tracking_sigma
-        self.vx_abs_error_coef = vx_abs_error_coef
-        self.continuous_action_coef = continuous_action_coef
         self.selector_reference_coef = selector_reference_coef
-        self.behavior_reference_coef = behavior_reference_coef
-        self.action_delta_coef = action_delta_coef
-        self.vertical_velocity_coef = vertical_velocity_coef
 
         self.num_envs = self.env.num_envs
         self.device = self.env.device
@@ -157,6 +165,9 @@ class HighLevelGaitWrapper:
         )
         self.low_level_obs = None
         self.last_reward_terms = {}
+        self.target_gait_ids = None
+        self.selector_reference_coef_tensor = None
+        self.task_reward_weights = None
 
     def reset(self):
         self.low_level_obs = self.env.reset()
@@ -170,6 +181,22 @@ class HighLevelGaitWrapper:
         self.velocity_command[:, 1] = torch.as_tensor(vy, device=self.device, dtype=torch.float)
         self.velocity_command[:, 2] = torch.as_tensor(yaw, device=self.device, dtype=torch.float)
         self.env.commands[:, 0:3] = self.velocity_command
+
+    def set_target_gait(self, gait_ids, selector_reference_coef=None):
+        self.target_gait_ids = torch.as_tensor(gait_ids, device=self.device, dtype=torch.long)
+        if selector_reference_coef is not None:
+            self.selector_reference_coef_tensor = torch.as_tensor(
+                selector_reference_coef,
+                device=self.device,
+                dtype=torch.float,
+            )
+
+    def set_task_reward_weights(self, weights):
+        weights = torch.as_tensor(weights, device=self.device, dtype=torch.float)
+        expected_shape = (self.num_envs, len(self.TASK_REWARD_NAMES))
+        if tuple(weights.shape) != expected_shape:
+            raise ValueError(f"Expected task reward weights shape {expected_shape}, got {tuple(weights.shape)}")
+        self.task_reward_weights = weights
 
     def step(self, high_level_action):
         high_level_action = torch.clip(high_level_action.to(self.device), -1.0, 1.0).detach()
@@ -193,13 +220,21 @@ class HighLevelGaitWrapper:
                 "slip_penalty": torch.zeros(self.num_envs, device=self.device),
                 "action_delta_penalty": torch.zeros(self.num_envs, device=self.device),
                 "continuous_action_penalty": torch.zeros(self.num_envs, device=self.device),
+                "action_boundary_penalty": torch.zeros(self.num_envs, device=self.device),
                 "selector_reference_penalty": torch.zeros(self.num_envs, device=self.device),
                 "behavior_reference_penalty": torch.zeros(self.num_envs, device=self.device),
-                "vx_abs_error_penalty": torch.zeros(self.num_envs, device=self.device),
                 "vertical_velocity_penalty": torch.zeros(self.num_envs, device=self.device),
+                "lateral_velocity_penalty": torch.zeros(self.num_envs, device=self.device),
+                "roll_rate_penalty": torch.zeros(self.num_envs, device=self.device),
+                "pitch_rate_penalty": torch.zeros(self.num_envs, device=self.device),
+                "yaw_rate_penalty": torch.zeros(self.num_envs, device=self.device),
+                "clearance_reward": torch.zeros(self.num_envs, device=self.device),
+                "weighted_metric_reward": torch.zeros(self.num_envs, device=self.device),
                 "edge_reset": torch.zeros(self.num_envs, device=self.device),
                 "fall_penalty": torch.zeros(self.num_envs, device=self.device),
             }
+            for name in self.TASK_REWARD_NAMES:
+                reward_terms[f"score_{name}"] = torch.zeros(self.num_envs, device=self.device)
 
         for _ in range(self.low_level_steps):
             self._apply_high_level_action()
@@ -308,6 +343,19 @@ class HighLevelGaitWrapper:
         return torch.maximum(torch.minimum(behavior, self.behavior_highs), self.behavior_lows)
 
     def _speed_conditioned_target(self):
+        if self.target_gait_ids is not None:
+            target_selector_weights = torch.nn.functional.one_hot(
+                self.target_gait_ids,
+                num_classes=self.num_gaits,
+            ).to(device=self.device, dtype=torch.float)
+            target_residual_actions = torch.zeros(
+                self.num_envs,
+                self.num_behavior_actions,
+                device=self.device,
+                dtype=torch.float,
+            )
+            return target_selector_weights, target_residual_actions
+
         speed = torch.clamp(torch.abs(self.env.commands[:, 0]), 0.0, 2.0)
         speed_unit = speed / 2.0
         high_speed_weight = torch.clamp((speed - 1.1) / 0.7, 0.0, 1.0)
@@ -372,6 +420,11 @@ class HighLevelGaitWrapper:
         continuous_action_penalty = torch.mean(
             self.high_level_action[:, self.num_gaits :] ** 2, dim=1
         )
+        residual_abs = torch.abs(self.high_level_action[:, self.num_gaits :])
+        action_boundary_penalty = torch.mean(
+            torch.clamp((residual_abs - 0.85) / 0.15, min=0.0) ** 2,
+            dim=1,
+        )
         selector_weights = self._selector_weights(self.high_level_action)
         target_selector_weights, target_residual_actions = self._speed_conditioned_target()
         residual_actions = self.high_level_action[:, self.num_gaits :]
@@ -381,11 +434,40 @@ class HighLevelGaitWrapper:
         behavior_reference_penalty = torch.mean(
             (residual_actions - target_residual_actions) ** 2, dim=1
         )
-        vx_abs_error_penalty = torch.abs(vx_error)
         vertical_velocity_penalty = self.env.base_lin_vel[:, 2] ** 2
+        lateral_velocity_penalty = self.env.base_lin_vel[:, 1] ** 2
+        roll_rate_penalty = self.env.base_ang_vel[:, 0] ** 2
+        pitch_rate_penalty = self.env.base_ang_vel[:, 1] ** 2
+        yaw_rate_penalty = self.env.base_ang_vel[:, 2] ** 2
+        mapped = self._map_action(self.high_level_action)
+        clearance_reward = torch.clamp(
+            (mapped["footswing_height"] - self.footswing_range[0])
+            / (self.footswing_range[1] - self.footswing_range[0]),
+            0.0,
+            1.0,
+        )
 
         edge_reset = self._get_edge_reset_buf()
         fall_penalty = (dones.bool() & ~edge_reset).float()
+        selector_reference_coef = self._get_selector_reference_coef()
+        metric_scores = self._compute_metric_scores(
+            velocity_reward=velocity_reward,
+            yaw_reward=yaw_reward,
+            orientation_penalty=orientation_penalty,
+            pitch_rate_penalty=pitch_rate_penalty,
+            roll_rate_penalty=roll_rate_penalty,
+            yaw_rate_penalty=yaw_rate_penalty,
+            lateral_velocity_penalty=lateral_velocity_penalty,
+            vertical_velocity_penalty=vertical_velocity_penalty,
+            slip_penalty=slip_penalty,
+            torque_penalty=torque_penalty,
+            clearance_reward=clearance_reward,
+            action_delta_penalty=action_delta_penalty,
+            continuous_action_penalty=continuous_action_penalty,
+            action_boundary_penalty=action_boundary_penalty,
+            fall_penalty=fall_penalty,
+        )
+        weighted_metric_reward = self._compute_weighted_metric_reward(metric_scores)
         if self.record_reward_terms:
             self.last_reward_terms = {
                 "velocity_reward": velocity_reward,
@@ -395,28 +477,68 @@ class HighLevelGaitWrapper:
                 "slip_penalty": slip_penalty,
                 "action_delta_penalty": action_delta_penalty,
                 "continuous_action_penalty": continuous_action_penalty,
+                "action_boundary_penalty": action_boundary_penalty,
                 "selector_reference_penalty": selector_reference_penalty,
                 "behavior_reference_penalty": behavior_reference_penalty,
-                "vx_abs_error_penalty": vx_abs_error_penalty,
                 "vertical_velocity_penalty": vertical_velocity_penalty,
+                "lateral_velocity_penalty": lateral_velocity_penalty,
+                "roll_rate_penalty": roll_rate_penalty,
+                "pitch_rate_penalty": pitch_rate_penalty,
+                "yaw_rate_penalty": yaw_rate_penalty,
+                "clearance_reward": clearance_reward,
+                "weighted_metric_reward": weighted_metric_reward,
                 "edge_reset": edge_reset.float(),
                 "fall_penalty": fall_penalty,
             }
+            for i, name in enumerate(self.TASK_REWARD_NAMES):
+                self.last_reward_terms[f"score_{name}"] = metric_scores[:, i]
 
-        return (
-            2.0 * velocity_reward
-            + 0.5 * yaw_reward
-            - orientation_penalty
-            - 0.05 * torque_penalty
-            - 0.5 * slip_penalty
-            - self.action_delta_coef * action_delta_penalty
-            - self.continuous_action_coef * continuous_action_penalty
-            - self.selector_reference_coef * selector_reference_penalty
-            - self.behavior_reference_coef * behavior_reference_penalty
-            - self.vx_abs_error_coef * vx_abs_error_penalty
-            - self.vertical_velocity_coef * vertical_velocity_penalty
-            - 10.0 * fall_penalty
+        return weighted_metric_reward - selector_reference_coef * selector_reference_penalty
+
+    def _compute_metric_scores(
+        self,
+        velocity_reward,
+        yaw_reward,
+        orientation_penalty,
+        pitch_rate_penalty,
+        roll_rate_penalty,
+        yaw_rate_penalty,
+        lateral_velocity_penalty,
+        vertical_velocity_penalty,
+        slip_penalty,
+        torque_penalty,
+        clearance_reward,
+        action_delta_penalty,
+        continuous_action_penalty,
+        action_boundary_penalty,
+        fall_penalty,
+    ):
+        return torch.stack(
+            (
+                velocity_reward,
+                yaw_reward,
+                torch.exp(-orientation_penalty / 0.05),
+                torch.exp(-pitch_rate_penalty / 0.25),
+                torch.exp(-roll_rate_penalty / 0.25),
+                torch.exp(-yaw_rate_penalty / 0.25),
+                torch.exp(-lateral_velocity_penalty / 0.05),
+                torch.exp(-vertical_velocity_penalty / 0.05),
+                torch.exp(-slip_penalty / 0.05),
+                torch.exp(-torque_penalty / 0.50),
+                clearance_reward,
+                torch.exp(-action_delta_penalty / 0.05),
+                torch.exp(-continuous_action_penalty / 0.25),
+                torch.exp(-action_boundary_penalty / 0.25),
+                1.0 - fall_penalty,
+            ),
+            dim=1,
         )
+
+    def _compute_weighted_metric_reward(self, scores):
+        if self.task_reward_weights is None:
+            return torch.mean(scores, dim=1)
+        weight_sum = torch.sum(self.task_reward_weights, dim=1).clamp(min=1e-6)
+        return torch.sum(self.task_reward_weights * scores, dim=1) / weight_sum
 
     def __getattr__(self, name):
         return getattr(self.env, name)
@@ -432,3 +554,8 @@ class HighLevelGaitWrapper:
         if edge_reset is None:
             return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         return edge_reset.to(device=self.device, dtype=torch.bool)
+
+    def _get_selector_reference_coef(self):
+        if self.selector_reference_coef_tensor is not None:
+            return self.selector_reference_coef_tensor
+        return self.selector_reference_coef

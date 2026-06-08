@@ -16,58 +16,29 @@ from go2_gym.envs.base.legged_robot_config import Cfg
 from go2_gym.envs.go2.go2_config import config_go2
 from go2_gym.envs.go2.velocity_tracking import VelocityTrackingEasyEnv
 from go2_gym.envs.wrappers.history_wrapper import HistoryWrapper
-from scan_gait_params import GAIT_PARAMS, find_logdir, load_policy, parse_floats, parse_strings
+from gait_conditions import CONDITIONS, apply_condition_cfg
+from train_high_level_ppo import find_logdir, load_low_level_policy as load_policy
 
 
-CONDITIONS = {
-    "flat",
-    "low_friction",
-    "very_low_friction",
-    "rough",
-    "rough_mid",
-    "rough_hard",
-    "rough_slope",
-    "ramp_up",
-    "slope",
-    "stairs",
-    "stairs_up_low",
-    "stairs_down_low",
-    "stairs_up",
-    "stairs_down",
-    "discrete_obstacles_low",
-    "discrete_obstacles",
-    "stepping_stones_easy",
-    "stepping_stones",
-    "push",
-    "push_hard",
-    "push_lateral",
-    "push_longitudinal",
-    "push_down",
-    "push_up",
-    "push_forward",
-    "push_backward",
-    "push_left",
-    "push_right",
+GAIT_PARAMS = {
+    # Values fill command indices [5:8] = phase, offset, bound.
+    "pronking": (0.0, 0.0, 0.0),
+    "trotting": (0.5, 0.0, 0.0),
+    "bounding": (0.0, 0.5, 0.0),
+    "pacing": (0.0, 0.0, 0.5),
 }
 
 
-DIRECTIONAL_PUSH_VELOCITIES = {
-    "push_forward": (1.5, 0.0, 0.0),
-    "push_backward": (-1.5, 0.0, 0.0),
-    "push_left": (0.0, 1.5, 0.0),
-    "push_right": (0.0, -1.5, 0.0),
-    "push_down": (0.0, 0.0, -1.5),
-    "push_up": (0.0, 0.0, 1.5),
-}
+def parse_floats(value):
+    return [float(v.strip()) for v in value.split(",") if v.strip()]
 
 
-PUSH_AXIS_CONDITIONS = {
-    "push_longitudinal": 0,
-    "push_lateral": 1,
-}
-
-
-DIRECTED_PUSH_INTERVAL_S = 2.0
+def parse_strings(value):
+    values = [v.strip() for v in value.split(",") if v.strip()]
+    unknown = [v for v in values if v not in GAIT_PARAMS]
+    if unknown:
+        raise argparse.ArgumentTypeError(f"Unknown gait(s): {unknown}. Choices: {sorted(GAIT_PARAMS)}")
+    return values
 
 
 def build_grid(args):
@@ -82,163 +53,6 @@ def build_grid(args):
     ]
     names, values = zip(*keys)
     return [dict(zip(names, combo)) for combo in itertools.product(*values)]
-
-
-def apply_condition_cfg(condition):
-    if condition not in CONDITIONS:
-        raise ValueError(f"Unknown condition '{condition}'. Choices: {sorted(CONDITIONS)}")
-
-    # Defaults: deterministic flat-ish evaluation without domain randomization.
-    Cfg.domain_rand.push_robots = False
-    Cfg.domain_rand.randomize_friction = False
-    Cfg.domain_rand.randomize_gravity = False
-    Cfg.domain_rand.randomize_restitution = False
-    Cfg.domain_rand.randomize_motor_offset = False
-    Cfg.domain_rand.randomize_motor_strength = False
-    Cfg.domain_rand.randomize_friction_indep = False
-    Cfg.domain_rand.randomize_ground_friction = False
-    Cfg.domain_rand.randomize_base_mass = False
-    Cfg.domain_rand.randomize_Kd_factor = False
-    Cfg.domain_rand.randomize_Kp_factor = False
-    Cfg.domain_rand.randomize_joint_friction = False
-    Cfg.domain_rand.randomize_com_displacement = False
-    Cfg.domain_rand.randomize_rigids_after_start = False
-    Cfg.domain_rand.push_vel_xy = None
-    Cfg.domain_rand.push_vel_xyz = None
-    Cfg.domain_rand.push_axis = None
-
-    # Use a zero-height trimesh even for flat conditions. The plane branch in this
-    # codebase builds CPU origin tensors and fails when assigning to CUDA env buffers.
-    Cfg.terrain.mesh_type = "trimesh"
-    Cfg.terrain.measure_heights = False
-    Cfg.terrain.curriculum = False
-    Cfg.terrain.selected = False
-    Cfg.terrain.static_friction = 1.0
-    Cfg.terrain.dynamic_friction = 1.0
-    Cfg.terrain.restitution = 0.0
-    Cfg.terrain.terrain_noise_magnitude = 0.0
-    Cfg.terrain.terrain_proportions = [0, 0, 0, 0, 0, 0, 0, 0, 1.0]
-    Cfg.terrain.terrain_length = 4.0
-    Cfg.terrain.terrain_width = 4.0
-    Cfg.terrain.x_init_range = 0.0
-    Cfg.terrain.y_init_range = 0.0
-    Cfg.terrain.teleport_robots = True
-    Cfg.terrain.teleport_thresh = 1.0
-    Cfg.terrain.center_robots = False
-    Cfg.terrain.stair_step_height = None
-    Cfg.terrain.discrete_obstacles_height = None
-    Cfg.terrain.stepping_stones_size = None
-    Cfg.terrain.stone_distance = None
-    Cfg.terrain.stepping_stones_platform_size = 4.0
-    Cfg.terrain.stepping_stones_max_height = 0.0
-    Cfg.terrain.stepping_stones_depth = -10.0
-    Cfg.terrain.ramp_slope = None
-
-    if condition == "low_friction":
-        Cfg.terrain.static_friction = 0.25
-        Cfg.terrain.dynamic_friction = 0.25
-        Cfg.domain_rand.randomize_friction = True
-        Cfg.domain_rand.friction_range = [0.25, 0.26]
-    elif condition == "very_low_friction":
-        Cfg.terrain.static_friction = 0.12
-        Cfg.terrain.dynamic_friction = 0.12
-        Cfg.domain_rand.randomize_friction = True
-        Cfg.domain_rand.friction_range = [0.12, 0.13]
-    elif condition == "rough":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.terrain_noise_magnitude = 0.10
-        Cfg.terrain.terrain_proportions = [0, 0, 0, 0, 0, 0, 0, 0, 1.0]
-    elif condition == "rough_mid":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.terrain_noise_magnitude = 0.12
-        Cfg.terrain.terrain_proportions = [0, 0, 0, 0, 0, 0, 0, 0, 1.0]
-    elif condition == "rough_hard":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.terrain_noise_magnitude = 0.16
-        Cfg.terrain.terrain_proportions = [0, 0, 0, 0, 0, 0, 0, 0, 1.0]
-    elif condition == "rough_slope":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.terrain_proportions = [0, 1.0, 0, 0, 0, 0, 0, 0, 0]
-    elif condition == "ramp_up":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.ramp_slope = 0.20
-        Cfg.terrain.terrain_proportions = [1.0, 0, 0, 0, 0, 0, 0, 0, 0]
-    elif condition == "slope":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.difficulty_scale = 0.6
-        Cfg.terrain.terrain_proportions = [1.0, 0, 0, 0, 0, 0, 0, 0, 0]
-    elif condition == "stairs":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.difficulty_scale = 0.35
-        Cfg.terrain.terrain_proportions = [0, 0, 1.0, 0, 0, 0, 0, 0, 0]
-    elif condition == "stairs_up_low":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.stair_step_height = 0.08
-        Cfg.terrain.terrain_proportions = [0, 0, 0, 1.0, 0, 0, 0, 0, 0]
-    elif condition == "stairs_down_low":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.stair_step_height = 0.08
-        Cfg.terrain.terrain_proportions = [0, 0, 1.0, 0, 0, 0, 0, 0, 0]
-    elif condition == "stairs_up":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.terrain_proportions = [0, 0, 0, 1.0, 0, 0, 0, 0, 0]
-    elif condition == "stairs_down":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.terrain_proportions = [0, 0, 1.0, 0, 0, 0, 0, 0, 0]
-    elif condition == "discrete_obstacles":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.terrain_proportions = [0, 0, 0, 0, 1.0, 0, 0, 0, 0]
-    elif condition == "discrete_obstacles_low":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.discrete_obstacles_height = 0.08
-        Cfg.terrain.terrain_proportions = [0, 0, 0, 0, 1.0, 0, 0, 0, 0]
-    elif condition == "stepping_stones":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.stepping_stones_size = 0.55
-        Cfg.terrain.stone_distance = 0.16
-        Cfg.terrain.stepping_stones_platform_size = 1.0
-        Cfg.terrain.stepping_stones_depth = -0.12
-        Cfg.terrain.terrain_proportions = [0, 0, 0, 0, 0, 1.0, 0, 0, 0]
-    elif condition == "stepping_stones_easy":
-        Cfg.terrain.mesh_type = "trimesh"
-        Cfg.terrain.measure_heights = True
-        Cfg.terrain.stepping_stones_size = 0.80
-        Cfg.terrain.stone_distance = 0.10
-        Cfg.terrain.stepping_stones_platform_size = 1.2
-        Cfg.terrain.stepping_stones_depth = -0.06
-        Cfg.terrain.terrain_proportions = [0, 0, 0, 0, 0, 1.0, 0, 0, 0]
-    elif condition == "push":
-        Cfg.domain_rand.push_robots = True
-        Cfg.domain_rand.push_interval_s = 0.5
-        Cfg.domain_rand.max_push_vel_xy = 1.0
-    elif condition == "push_hard":
-        Cfg.domain_rand.push_robots = True
-        Cfg.domain_rand.push_interval_s = 0.4
-        Cfg.domain_rand.max_push_vel_xy = 1.5
-    elif condition in DIRECTIONAL_PUSH_VELOCITIES:
-        Cfg.domain_rand.push_robots = True
-        Cfg.domain_rand.push_interval_s = DIRECTED_PUSH_INTERVAL_S
-        Cfg.domain_rand.max_push_vel_xy = 1.5
-        Cfg.domain_rand.push_vel_xyz = DIRECTIONAL_PUSH_VELOCITIES[condition]
-    elif condition in PUSH_AXIS_CONDITIONS:
-        Cfg.domain_rand.push_robots = True
-        Cfg.domain_rand.push_interval_s = DIRECTED_PUSH_INTERVAL_S
-        Cfg.domain_rand.max_push_vel_xy = 1.5
-        Cfg.domain_rand.push_axis = PUSH_AXIS_CONDITIONS[condition]
 
 
 def load_env(
@@ -260,7 +74,7 @@ def load_env(
                 for key2, value2 in value.items():
                     setattr(getattr(Cfg, key), key2, value2)
 
-    apply_condition_cfg(condition)
+    apply_condition_cfg(Cfg, condition)
 
     Cfg.env.num_envs = num_envs
     Cfg.env.num_recording_envs = 0

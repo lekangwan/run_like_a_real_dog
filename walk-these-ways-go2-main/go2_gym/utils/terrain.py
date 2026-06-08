@@ -82,10 +82,41 @@ class Terrain:
             # Env coordinates in the world
             (i, j) = np.unravel_index(k, (cfg.num_rows, cfg.num_cols))
 
-            choice = np.random.uniform(0, 1)
             difficulty = np.random.choice([0.5, 0.75, 0.9])
-            terrain = self.make_terrain(cfg, choice, difficulty, cfg.proportions)
+            env_conditions = getattr(cfg, "env_conditions", None)
+            if env_conditions is not None:
+                terrain = self.make_condition_terrain(cfg, env_conditions[k % len(env_conditions)], difficulty)
+            else:
+                choice = np.random.uniform(0, 1)
+                terrain = self.make_terrain(cfg, choice, difficulty, cfg.proportions)
             self.add_terrain_to_map(cfg, terrain, i, j)
+
+    def make_condition_terrain(self, cfg, condition, difficulty):
+        terrain = terrain_utils.SubTerrain("terrain",
+                                           width=cfg.width_per_env_pixels,
+                                           length=cfg.width_per_env_pixels,
+                                           vertical_scale=cfg.vertical_scale,
+                                           horizontal_scale=cfg.horizontal_scale)
+        if condition in ("flat", "push_lateral"):
+            return terrain
+        if condition == "ramp_up":
+            x = np.arange(terrain.height_field_raw.shape[0], dtype=np.float32) * terrain.horizontal_scale
+            heights = 0.20 * x
+            terrain.height_field_raw[:, :] = np.round(heights[:, None] / terrain.vertical_scale).astype(np.int16)
+            return terrain
+        if condition == "rough_slope":
+            terrain_utils.pyramid_sloped_terrain(terrain, slope=0.4 * difficulty, platform_size=3.)
+            terrain_utils.random_uniform_terrain(terrain, min_height=-0.05, max_height=0.05,
+                                                 step=cfg.terrain_smoothness, downsampled_scale=0.2)
+            return terrain
+        if condition == "stepping_stones_easy":
+            terrain_utils.stepping_stones_terrain(terrain, stone_size=0.80,
+                                                  stone_distance=0.10,
+                                                  max_height=0.0,
+                                                  platform_size=1.2,
+                                                  depth=-0.06)
+            return terrain
+        raise ValueError(f"Unsupported mixed training condition: {condition}")
 
     def curriculum(self, cfg):
         for j in range(cfg.num_cols):

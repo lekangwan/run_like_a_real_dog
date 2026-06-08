@@ -1039,10 +1039,21 @@ class LeggedRobot(BaseTask):
                 return
 
             max_vel = cfg.domain_rand.max_push_vel_xy
+            push_axis_by_env = getattr(cfg.domain_rand, "push_axis_by_env", None)
             push_vel_xy = getattr(cfg.domain_rand, "push_vel_xy", None)
             push_vel_xyz = getattr(cfg.domain_rand, "push_vel_xyz", None)
             push_axis = getattr(cfg.domain_rand, "push_axis", None)
-            if push_vel_xyz is not None:
+            if push_axis_by_env is not None:
+                push_axes = torch.tensor(push_axis_by_env, dtype=torch.long, device=self.device)
+                valid_ids = env_ids[push_axes[env_ids] >= 0]
+                if len(valid_ids) == 0:
+                    return
+                signs = torch.randint(0, 2, (len(valid_ids),), device=self.device, dtype=torch.float)
+                signs = signs * 2.0 - 1.0
+                axes = push_axes[valid_ids]
+                self.root_states[valid_ids, 7:10] = 0.0
+                self.root_states[valid_ids, 7 + axes] = signs * max_vel
+            elif push_vel_xyz is not None:
                 push = torch.tensor(push_vel_xyz, dtype=self.root_states.dtype, device=self.device)
                 self.root_states[env_ids, 7:10] = push.view(1, 3).repeat(len(env_ids), 1)
             elif push_axis is not None:

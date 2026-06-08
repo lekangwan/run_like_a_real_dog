@@ -5,9 +5,14 @@ from pathlib import Path
 
 import pandas as pd
 
-
-DEFAULT_TASK_MAP = "logs/gait_condition_eval_v8_mainline/training_task_map/training_task_map_by_speed.csv"
-DEFAULT_LIBRARY = "logs/gait_condition_eval_v8_mainline/gait_template_library/gait_template_library.csv"
+from gait_project_config import (
+    MAINLINE_TASK_MAP,
+    MAINLINE_TEMPLATE_LIBRARY,
+    VIS_EDGE_RESET_MARGIN,
+    VIS_TELEPORT_THRESH,
+    VIS_TERRAIN_LENGTH,
+    VIS_TERRAIN_WIDTH,
+)
 
 
 def parse_strings(value):
@@ -93,15 +98,15 @@ def print_scene(index, total, scene):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task-map", default=DEFAULT_TASK_MAP)
-    parser.add_argument("--library", default=DEFAULT_LIBRARY)
+    parser.add_argument("--task-map", default=str(MAINLINE_TASK_MAP))
+    parser.add_argument("--library", default=str(MAINLINE_TEMPLATE_LIBRARY))
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--max-envs", type=int, default=4)
     parser.add_argument("--print-interval", type=int, default=200)
-    parser.add_argument("--terrain-length", type=float, default=30.0)
-    parser.add_argument("--terrain-width", type=float, default=30.0)
-    parser.add_argument("--teleport-thresh", type=float, default=3.0)
-    parser.add_argument("--edge-reset-margin", type=float, default=3.0)
+    parser.add_argument("--terrain-length", type=float, default=VIS_TERRAIN_LENGTH)
+    parser.add_argument("--terrain-width", type=float, default=VIS_TERRAIN_WIDTH)
+    parser.add_argument("--teleport-thresh", type=float, default=VIS_TELEPORT_THRESH)
+    parser.add_argument("--edge-reset-margin", type=float, default=VIS_EDGE_RESET_MARGIN)
     parser.add_argument(
         "--include-label-types",
         type=parse_strings,
