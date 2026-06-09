@@ -81,6 +81,22 @@ def read_metrics(path):
     return rows
 
 
+def dedupe_iteration_rows(rows):
+    if not rows or "iteration" not in rows[0]:
+        return rows
+    by_iteration = {}
+    for row in rows:
+        by_iteration[int(row["iteration"])] = row
+    if len(by_iteration) == len(rows):
+        return rows
+    deduped = [by_iteration[key] for key in sorted(by_iteration)]
+    print(
+        f"Deduplicated repeated iterations: raw_rows={len(rows)} "
+        f"unique_iterations={len(deduped)}"
+    )
+    return deduped
+
+
 def latest_route_test_dir(run_dir):
     route_root = Path(run_dir) / "route_tests"
     if not route_root.exists():
@@ -402,7 +418,7 @@ def main():
 
     run_dir = Path(args.run_dir)
     metrics_path = run_dir / "metrics.csv"
-    rows = read_metrics(metrics_path)
+    rows = dedupe_iteration_rows(read_metrics(metrics_path))
     window = min(args.window, len(rows))
     output_dir = Path(args.output_dir) if args.output_dir else run_dir / "analysis"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -410,7 +426,7 @@ def main():
     summary = summarize(rows, window)
     baseline_summary = None
     if args.baseline_run_dir:
-        baseline_rows = read_metrics(Path(args.baseline_run_dir) / "metrics.csv")
+        baseline_rows = dedupe_iteration_rows(read_metrics(Path(args.baseline_run_dir) / "metrics.csv"))
         baseline_summary = summarize(baseline_rows, min(args.window, len(baseline_rows)))
 
     route_dir = None
