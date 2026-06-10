@@ -116,14 +116,29 @@ class HybridActor(nn.Module):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, num_gaits, residual_dim, hidden_dims=(256, 256), init_std=0.5):
+    def __init__(
+        self,
+        obs_dim,
+        num_gaits,
+        residual_dim,
+        base_obs_dim=None,
+        priv_dim=14,
+        z_dim=16,
+        hidden_dims=(256, 256),
+        init_std=0.5,
+    ):
         super().__init__()
-        self.actor = HybridActor(obs_dim, num_gaits, residual_dim, hidden_dims)
+        self.z_dim = z_dim
         self.num_gaits = num_gaits
         self.residual_dim = residual_dim
 
+        # ── actor ──
+        actor_input_dim = obs_dim + z_dim  # = obs_dim when z_dim == 0
+        self.actor = HybridActor(actor_input_dim, num_gaits, residual_dim, hidden_dims)
+
+        # ── critic ──
         critic_layers = []
-        last_dim = obs_dim
+        last_dim = actor_input_dim
         for hidden_dim in hidden_dims:
             critic_layers += [nn.Linear(last_dim, hidden_dim), nn.ELU()]
             last_dim = hidden_dim
@@ -131,6 +146,45 @@ class ActorCritic(nn.Module):
         self.critic = nn.Sequential(*critic_layers)
 
         self.log_std = nn.Parameter(torch.log(torch.ones(residual_dim) * init_std))
+
+        # ── RMA modules (skipped when z_dim == 0) ──
+        if z_dim > 0:
+            self.terrain_encoder = nn.Sequential(
+                nn.Linear(priv_dim, 128),
+                nn.ELU(),
+                nn.Linear(128, 64),
+                nn.ELU(),
+                nn.Linear(64, z_dim),
+            )
+            adapt_input_dim = base_obs_dim if base_obs_dim is not None else obs_dim
+            self.adaptation_module = nn.Sequential(
+                nn.Linear(adapt_input_dim, 256),
+                nn.ELU(),
+                nn.Linear(256, 128),
+                nn.ELU(),
+                nn.Linear(128, z_dim),
+            )
+        else:
+            self.terrain_encoder = None
+            self.adaptation_module = None
+
+    def encode_teacher(self, privileged_obs):
+        """Encode privileged simulation info → z_teacher (training only).
+
+        Returns None when z_dim == 0.
+        """
+        if self.z_dim == 0:
+            return None
+        return self.terrain_encoder(privileged_obs)
+
+    def encode_student(self, proprioceptive_history):
+        """Encode proprioceptive history → z_student (inference-capable).
+
+        Returns None when z_dim == 0.
+        """
+        if self.z_dim == 0:
+            return None
+        return self.adaptation_module(proprioceptive_history)
 
     def distribution(self, obs):
         gait_logits, residual_mean = self.actor.distribution_params(obs)
@@ -157,7 +211,27 @@ class ActorCritic(nn.Module):
         return log_prob, entropy, value
 
     def act_inference(self, obs):
+        """Deterministic forward pass for evaluation / deployment."""
         return self.actor(obs)
+
+    def act_student(self, obs):
+        """Student-only inference for deployment (no privileged info needed).
+
+        When z_dim == 0 this is identical to act_inference.
+
+        Args:
+            obs: [N, obs_dim] observation.
+
+        Returns:
+            action: [N, num_gaits + residual_dim] high-level action.
+        """
+        if self.z_dim == 0:
+            return self.actor(obs)
+        base_dim = self.adaptation_module[0].in_features
+        base_obs = obs[:, :base_dim]
+        z = self.adaptation_module(base_obs)
+        aug_obs = torch.cat((obs, z), dim=-1)
+        return self.actor(aug_obs)
 
 
 class RolloutBuffer:

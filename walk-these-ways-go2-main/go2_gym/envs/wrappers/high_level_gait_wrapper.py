@@ -623,3 +623,109 @@ class HighLevelGaitWrapper:
         if self.selector_reference_coef_tensor is not None:
             return self.selector_reference_coef_tensor
         return self.selector_reference_coef
+
+    def get_high_level_privileged_obs(self):
+        """Assemble privileged environment observations for high-level RMA training.
+
+        Returns a 14-dim tensor per env containing terrain, dynamics, push,
+        and body-state information that is available in simulation but not
+        on the real robot.  Used as the teacher target for AdaptationModule.
+
+        Layout:
+          0  terrain_height_mean   mean of measured_heights, clamped
+          1  terrain_height_std    std  of measured_heights, clamped
+          2  terrain_height_range  max-min of measured_heights, clamped
+          3  terrain_slope         front-back height gradient proxy
+          4  friction              ground friction coefficient
+          5  base_mass             payload / added mass
+          6  com_dx                COM displacement x, normalised
+          7  com_dy                COM displacement y, normalised
+          8  com_dz                COM displacement z, normalised
+          9  push_active           1.0 if push is enabled for this env
+         10  push_axis             -1 none / 0 longitudinal / 1 lateral
+         11  body_height           base height above ground, normalised
+         12  pitch_proxy           projected-gravity x component
+         13  roll_proxy            projected-gravity y component
+        """
+        base_env = self._get_base_env()
+
+        # --- terrain height stats from measured_heights ---
+        heights = getattr(base_env, "measured_heights", None)
+        if heights is not None and heights.ndim == 2 and heights.shape[1] > 0:
+            h_mean = torch.clamp(heights.mean(dim=1) / 0.5, -1.0, 1.0).unsqueeze(1)
+            h_std = torch.clamp(heights.std(dim=1) / 0.3, 0.0, 1.0).unsqueeze(1)
+            h_range = torch.clamp(
+                (heights.max(dim=1).values - heights.min(dim=1).values) / 0.5, 0.0, 1.0
+            ).unsqueeze(1)
+            # slope proxy: difference between mean of front half and back half of height points
+            mid = heights.shape[1] // 2
+            front_mean = heights[:, mid:].mean(dim=1)
+            back_mean = heights[:, :mid].mean(dim=1)
+            h_slope = torch.clamp((front_mean - back_mean) / 0.3, -1.0, 1.0).unsqueeze(1)
+        else:
+            z = torch.zeros(self.num_envs, 1, device=self.device)
+            h_mean = h_std = h_range = h_slope = z
+
+        # --- friction ---
+        friction = getattr(base_env, "friction_coeffs", None)
+        if friction is not None and friction.ndim >= 1:
+            friction_val = torch.clamp(friction[:, 0] / 1.5, 0.0, 1.0).unsqueeze(1)
+        else:
+            friction_val = torch.zeros(self.num_envs, 1, device=self.device)
+
+        # --- base mass (payload) ---
+        payloads = getattr(base_env, "payloads", None)
+        if payloads is not None and payloads.ndim >= 1:
+            # payload range is roughly [-1, 3] kg
+            mass_val = torch.clamp((payloads.unsqueeze(1) + 1.0) / 4.0, 0.0, 1.0)
+        else:
+            mass_val = torch.zeros(self.num_envs, 1, device=self.device)
+
+        # --- COM displacement ---
+        com = getattr(base_env, "com_displacements", None)
+        if com is not None and com.ndim == 2 and com.shape[1] >= 3:
+            com_val = torch.clamp(com[:, :3] / 0.1, -1.0, 1.0)
+        else:
+            com_val = torch.zeros(self.num_envs, 3, device=self.device)
+
+        # --- push info ---
+        cfg = getattr(base_env, "cfg", None)
+        push_axis_by_env = None
+        if cfg is not None:
+            push_axis_by_env = getattr(cfg.domain_rand, "push_axis_by_env", None)
+        if push_axis_by_env is not None:
+            push_axis_t = torch.tensor(push_axis_by_env, device=self.device, dtype=torch.float)
+            push_active = (push_axis_t >= 0).float().unsqueeze(1)
+            push_axis_norm = torch.clamp(push_axis_t / 1.0, -1.0, 1.0).unsqueeze(1)
+        else:
+            push_active = torch.zeros(self.num_envs, 1, device=self.device)
+            push_axis_norm = -torch.ones(self.num_envs, 1, device=self.device)
+
+        # --- body height ---
+        # nominal height 0.34 m, scale so that 0.15-0.55 maps to roughly [-1,1]
+        root_z = base_env.root_states[: self.num_envs, 2]
+        body_height = torch.clamp((root_z - 0.34).unsqueeze(1) / 0.15, -1.0, 1.0)
+
+        # --- pitch / roll proxies from projected gravity ---
+        proj_grav = base_env.projected_gravity[: self.num_envs]
+        pitch_proxy = proj_grav[:, 0:1]
+        roll_proxy = proj_grav[:, 1:2]
+
+        priv = torch.cat(
+            (
+                h_mean,
+                h_std,
+                h_range,
+                h_slope,
+                friction_val,
+                mass_val,
+                com_val,
+                push_active,
+                push_axis_norm,
+                body_height,
+                pitch_proxy,
+                roll_proxy,
+            ),
+            dim=1,
+        )
+        return priv

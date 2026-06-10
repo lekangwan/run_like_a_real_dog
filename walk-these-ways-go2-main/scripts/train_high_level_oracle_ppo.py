@@ -60,20 +60,27 @@ BASE_METRIC_WEIGHTS = {
     "survival": 2.0,
 }
 TASK_REWARD_FOCUS_WEIGHTS = {
-    "progress": {"progress": 1.0},
-    "recovery_progress": {"progress": 1.0},
-    "low_energy": {"energy": 0.6},
-    "low_slip": {"slip": 0.8},
-    "low_vertical_bounce": {"vertical_bounce": 0.6},
+    # ── v4: data-driven reward focus ──
+    # progress / recovery_progress deliberately REMOVED from focus
+    #   (base 1.0 is enough; 2.0 was causing pace collapse)
+    # trot_contact_style / pace_contact_style / bound_contact_style
+    #   deliberately REMOVED (were silently dropped before, now clean)
+    "low_slip": {"slip": 1.2},               # was 0.8 — strongest anti-pace signal
+    "low_vertical_bounce": {"vertical_bounce": 0.8},  # was 0.6
     "low_lateral_drift": {"lateral_drift": 0.8},
-    "orientation_stability": {"orientation": 0.9},
+    # orientation_stability — split into 3 levels
+    "orientation_stability":        {"orientation": 0.5},   # total 0.8  (mild)
+    "orientation_stability_strong": {"orientation": 0.9},   # total 1.2  (rough, push)
+    "orientation_stability_mild":   {"orientation": 0.3},   # total 0.6  (stones)
     "pitch_control": {"pitch_rate": 0.8, "orientation": 0.4},
     "low_roll_pitch_rate": {"roll_rate": 0.6, "pitch_rate": 0.6},
     "low_roll_rate": {"roll_rate": 0.8},
-    "low_yaw_rate": {"yaw_rate": 0.8},
-    "low_done_rate": {"survival": 1.0},
-    "foot_clearance": {"clearance": 0.35},
+    "low_yaw_rate": {"yaw_rate": 0.6},                      # was 0.8
+    "low_done_rate": {"survival": 1.0},                     # kept but unused in v4
+    "foot_clearance": {"clearance": 0.6},                   # was 0.35
     "low_scuffing": {"clearance": 0.15},
+    # retained but unused in v4 focus:
+    "low_energy": {"energy": 0.6},
 }
 
 
@@ -312,6 +319,14 @@ class OracleConditionHighLevelEnv:
             return obs
         return torch.cat((obs, self.condition_one_hot), dim=-1)
 
+    def get_base_obs(self):
+        """Return raw proprioceptive history WITHOUT task one-hot (510D)."""
+        return self.env.obs_history.detach()
+
+    def get_high_level_privileged_obs(self):
+        """Delegate to HighLevelGaitWrapper for privileged environment info (14D)."""
+        return self.env.get_high_level_privileged_obs()
+
     def command_vx(self):
         return self.env.commands[:, 0]
 
@@ -423,6 +438,19 @@ def main():
         default=0.0,
         help="Scale for gait-label selector reward. Default 0 disables hard gait-label shaping.",
     )
+    parser.add_argument("--z-dim", type=int, default=16, help="Environment latent dimension for RMA distillation.")
+    parser.add_argument(
+        "--priv-dim",
+        type=int,
+        default=14,
+        help="Dimension of high-level privileged observation (teacher input).",
+    )
+    parser.add_argument(
+        "--adaptation-coef",
+        type=float,
+        default=0.1,
+        help="Weight of adaptation MSE loss in total training loss.",
+    )
     args = parser.parse_args()
 
     logdir = find_logdir(args.label, args.run_index)
@@ -442,9 +470,21 @@ def main():
     )
     device = env.device
 
-    model = ActorCritic(env.obs_dim, env.num_gaits, env.num_behavior_actions).to(device)
+    model = ActorCritic(
+        env.obs_dim,
+        env.num_gaits,
+        env.num_behavior_actions,
+        base_obs_dim=env.base_obs_dim,
+        priv_dim=args.priv_dim,
+        z_dim=args.z_dim,
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    use_rma = args.z_dim > 0
     obs = env.reset()
+    base_obs = env.get_base_obs() if use_rma else None
+
+    # ── observation dims after RMA augmentation ──
+    aug_obs_dim = env.obs_dim + args.z_dim  # = env.obs_dim when z_dim == 0
 
     run_name = args.run_name or time.strftime("%Y%m%d_%H%M%S_oracle")
     run_dir = Path(args.save_dir) / run_name
@@ -455,10 +495,16 @@ def main():
         args_dict["tasks"] = [vars(spec).copy() for spec in specs]
         args_dict["obs_dim"] = env.obs_dim
         args_dict["base_obs_dim"] = env.base_obs_dim
+        args_dict["aug_obs_dim"] = aug_obs_dim
         json.dump(args_dict, file, indent=2)
 
     print(f"Saving oracle high-level checkpoints to: {run_dir}")
-    print(f"obs_dim={env.obs_dim}, base_obs_dim={env.base_obs_dim}, action_dim={env.num_high_level_actions}")
+    print(
+        f"obs_dim={env.obs_dim} (+z={args.z_dim} → aug_obs_dim={aug_obs_dim}) "
+        f"base_obs_dim={env.base_obs_dim} "
+        f"priv_dim={args.priv_dim} "
+        f"action_dim={env.num_high_level_actions}"
+    )
     for task_index, spec in enumerate(specs):
         count = int((env.assignment.task_ids == task_index).sum().item())
         print(
@@ -468,10 +514,20 @@ def main():
         )
 
     for iteration in range(args.iterations):
+        progress = iteration / max(1, args.iterations - 1)
+
+        # ── phase-dependent alpha: z_input = α * z_teacher + (1-α) * z_student ──
+        if progress < 0.25:
+            alpha_val = 1.0  # teacher-only
+        elif progress < 0.75:
+            alpha_val = 1.0 - (progress - 0.25) / 0.5  # linear anneal 1→0
+        else:
+            alpha_val = 0.0  # student-only
+
         buffer = RolloutBuffer(
             args.num_steps,
             env.num_envs,
-            env.obs_dim,
+            aug_obs_dim,
             env.num_high_level_actions,
             device,
         )
@@ -488,14 +544,28 @@ def main():
         clearance_reward_sum = 0.0
         gait_switch_penalty_sum = 0.0
         action_boundary_penalty_sum = 0.0
+        adaptation_loss_sum = 0.0
         metric_score_sums = {name: 0.0 for name in HighLevelGaitWrapper.TASK_REWARD_NAMES}
         actual_actions = []
 
         for _ in range(args.num_steps):
+            # ── RMA: compute z_input (skip when z_dim == 0) ──
+            if use_rma:
+                priv_obs = env.get_high_level_privileged_obs()
+                base_obs_step = env.get_base_obs()
+                with torch.inference_mode():
+                    z_teacher = model.encode_teacher(priv_obs)
+                    z_student = model.encode_student(base_obs_step)
+                z_input = alpha_val * z_teacher + (1.0 - alpha_val) * z_student
+                obs_with_z = torch.cat((obs, z_input), dim=-1)
+            else:
+                obs_with_z = obs
+
             with torch.inference_mode():
-                action, log_prob, value = model.act(obs)
+                action, log_prob, value = model.act(obs_with_z)
                 next_obs, reward, done, info = env.step(action)
-            buffer.add(obs, action, log_prob, reward, done, value)
+
+            buffer.add(obs_with_z, action, log_prob, reward, done, value)
             executed_action = info.get("executed_high_level_action", env.env.high_level_action)
             actual_actions.append(executed_action.detach().clone())
             reward_sum += reward.mean().item()
@@ -527,9 +597,24 @@ def main():
                     metric_score_sums[name] += terms[key].mean().item()
             vx_error_sum += torch.abs(env.measured_vx() - env.command_vx()).mean().item()
             obs = next_obs
+            if use_rma:
+                base_obs = base_obs_step
 
         with torch.inference_mode():
-            last_value = model.critic(obs).squeeze(-1)
+            if use_rma:
+                priv_obs_final = env.get_high_level_privileged_obs()
+                base_obs_final = env.get_base_obs()
+                z_student_final = model.encode_student(base_obs_final)
+                if alpha_val > 0.0:
+                    z_teacher_final = model.encode_teacher(priv_obs_final)
+                    z_final = alpha_val * z_teacher_final + (1.0 - alpha_val) * z_student_final
+                else:
+                    z_final = z_student_final
+                obs_final_with_z = torch.cat((obs, z_final), dim=-1)
+            else:
+                obs_final_with_z = obs
+            last_value = model.critic(obs_final_with_z).squeeze(-1)
+
         buffer.compute_returns(last_value, args.gamma, args.lam)
 
         flat_obs, flat_actions, flat_log_probs, flat_returns, flat_advantages, _ = buffer.flat()
@@ -537,9 +622,14 @@ def main():
         batch_size = flat_obs.shape[0]
         mini_batch_size = max(1, batch_size // args.mini_batches)
 
+        # Pre-compute privileged obs for the full batch once per iteration
+        # (privileged obs are static per env, so repeat for num_steps)
+        priv_obs_flat = env.get_high_level_privileged_obs().repeat(args.num_steps, 1) if use_rma else None
+
         value_loss_epoch = 0.0
         policy_loss_epoch = 0.0
         entropy_epoch = 0.0
+        adaptation_loss_epoch = 0.0
         updates = 0
 
         for _ in range(args.epochs):
@@ -554,7 +644,22 @@ def main():
                 value_loss = (flat_returns[idx] - value).pow(2).mean()
                 entropy_loss = entropy.mean()
 
-                loss = policy_loss + args.value_coef * value_loss - args.entropy_coef * entropy_loss
+                # ── RMA adaptation loss (on the same mini-batch, skip when z_dim == 0) ──
+                if use_rma:
+                    mini_base_obs = flat_obs[idx, : env.base_obs_dim]
+                    mini_priv_obs = priv_obs_flat[idx]
+                    z_teacher_mini = model.encode_teacher(mini_priv_obs)
+                    z_student_mini = model.encode_student(mini_base_obs)
+                    adaptation_loss = torch.nn.functional.mse_loss(z_student_mini, z_teacher_mini.detach())
+                else:
+                    adaptation_loss = torch.tensor(0.0, device=device)
+
+                loss = (
+                    policy_loss
+                    + args.value_coef * value_loss
+                    - args.entropy_coef * entropy_loss
+                    + args.adaptation_coef * adaptation_loss
+                )
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -563,7 +668,23 @@ def main():
                 value_loss_epoch += value_loss.item()
                 policy_loss_epoch += policy_loss.item()
                 entropy_epoch += entropy_loss.item()
+                adaptation_loss_epoch += adaptation_loss.item()
                 updates += 1
+
+        # ── compute z statistics for logging (skip when z_dim == 0) ──
+        if use_rma:
+            base_obs_all = flat_obs[:, : env.base_obs_dim]
+            priv_obs_all = priv_obs_flat
+            with torch.inference_mode():
+                z_teacher_all = model.encode_teacher(priv_obs_all)
+                z_student_all = model.encode_student(base_obs_all)
+            z_teacher_mean = z_teacher_all.mean().item()
+            z_teacher_std = z_teacher_all.std().item()
+            z_student_mean = z_student_all.mean().item()
+            z_student_std = z_student_all.std().item()
+            z_error = torch.nn.functional.mse_loss(z_student_all, z_teacher_all).item()
+        else:
+            z_teacher_mean = z_teacher_std = z_student_mean = z_student_std = z_error = float("nan")
 
         metrics = {
             "iteration": iteration,
@@ -583,6 +704,13 @@ def main():
             "policy_loss": policy_loss_epoch / updates,
             "value_loss": value_loss_epoch / updates,
             "entropy": entropy_epoch / updates,
+            "adaptation_loss": adaptation_loss_epoch / updates,
+            "alpha": alpha_val,
+            "z_teacher_mean": z_teacher_mean,
+            "z_teacher_std": z_teacher_std,
+            "z_student_mean": z_student_mean,
+            "z_student_std": z_student_std,
+            "z_error": z_error,
             "log_std_mean": model.log_std.detach().mean().item(),
         }
         for name, value in metric_score_sums.items():
@@ -600,12 +728,25 @@ def main():
             f"lat_pos={metrics['lateral_position_penalty']:.3f} "
             f"switch={metrics['gait_switch_rate']:.3f} "
             f"metric={metrics['weighted_metric_reward']:.3f} "
+            f"adapt={metrics['adaptation_loss']:.4f} "
+            f"z_err={metrics['z_error']:.4f} "
             f"flat_trot={metrics.get('flat_trot_efficiency_trot_ratio', float('nan')):.2f} "
             f"push_pace={metrics.get('push_lateral_pace_recovery_pace_ratio', float('nan')):.2f} "
             f"stone_bound={metrics.get('stepping_stones_easy_bound_highspeed_bound_ratio', float('nan')):.2f}"
         )
 
-        del buffer, flat_obs, flat_actions, flat_log_probs, flat_returns, flat_advantages, actual_actions_flat, actual_actions
+        del (
+            buffer,
+            flat_obs,
+            flat_actions,
+            flat_log_probs,
+            flat_returns,
+            flat_advantages,
+            actual_actions_flat,
+            actual_actions,
+        )
+        if use_rma:
+            del base_obs_all, priv_obs_all, priv_obs_flat
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.synchronize(device)
