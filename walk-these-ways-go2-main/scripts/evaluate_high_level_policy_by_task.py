@@ -402,6 +402,7 @@ def main():
             edge_reset_margin=args.edge_reset_margin,
             teleport_thresh=args.teleport_thresh,
             mesh_type=args.mesh_type,
+            selector_hold_steps=int(run_args.get("selector_hold_steps", 3)),
         )
         model, checkpoint_iteration = load_model(checkpoint_path, env, run_args)
         obs = augment_for_checkpoint(env.reset(), task_index, len(all_specs), oracle_condition_obs)

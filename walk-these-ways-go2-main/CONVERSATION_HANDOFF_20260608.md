@@ -2,6 +2,10 @@
 
 Date: 2026-06-08
 
+> Historical note, superseded on 2026-06-12.
+> Read `CURRENT_GAIT_ADAPTATION_PLAN.md` first. This file is useful for
+> project history, but its training next steps are no longer the active plan.
+
 This document is intended for migrating the current project to a new Codex
 conversation. Read `ACTIVE_PROJECT_CONTEXT.md` first, then this file.
 

@@ -3,6 +3,15 @@
 This file is the short entrypoint for the current Go2 gait-adaptation project.
 Read this before editing training, evaluation, or visualization scripts.
 
+Current source-of-truth plan:
+
+```text
+CURRENT_GAIT_ADAPTATION_PLAN.md
+```
+
+The 2026-06-08 and 2026-06-11 handoff files are historical context. Do not use
+their next-step sections without checking the current plan above.
+
 ## Goal
 
 Build a high-level gait adaptation module on top of the frozen WTW Go2 low-level policy.
@@ -93,6 +102,8 @@ scripts/gait_project_config.py          shared paths and runtime defaults
 scripts/gait_conditions.py              shared terrain/disturbance setup
 scripts/train_high_level_ppo.py         reusable high-level PPO components
 scripts/train_high_level_oracle_ppo.py  current oracle-condition sanity trainer
+scripts/evaluate_fixed_gait_live_reward.py
+                                         fixed-gait live reward audit
 scripts/play_oracle_policy_training_map.py
                                          learned oracle policy visualization
 scripts/visualize_oracle_training_results.py
@@ -140,12 +151,20 @@ python3 scripts/play_training_scenes_oracle.py --dry-run
 
 ## Next Step
 
-Implement and train the high-level task-conditioned gait-parameter policy:
+Do not start another soft-prior or curriculum training run yet. The immediate
+next step is a fixed-gait live reward audit:
 
-- input: proprioceptive/history observations, not explicit terrain labels
-- output: gait selector plus continuous residual parameters
-- reward: one unified normalized metric table with shared base weights plus condition-specific weights
-- first run: local short verification, then server long training
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 scripts/evaluate_fixed_gait_live_reward.py \
+  --num-envs 32 \
+  --steps 1000 \
+  --warmup-steps 50
+```
+
+This checks whether the current live reward v4 actually ranks the expected gait
+highest for each task/speed. Only after this audit should we decide between
+reward correction, accepting the live-reward optimum, or adding a soft gait
+prior.
 
 ## Current Training Entry
 
@@ -196,6 +215,11 @@ the v3 model architecture.
 
 If oracle-condition training cannot separate the target gaits, do not train the
 final proprioception-only version yet; fix reward/scene design first.
+
+As of 2026-06-12, reward-only v4, selector-only long training, and single-task
+selector-only probes have not proven stable target-gait selector separation.
+The current unresolved question is whether live reward v4 itself ranks the
+target/template gait highest.
 
 The first 100-iteration oracle run showed a reward-design warning: foot swing
 height increased, but progress and action health slightly worsened. v2 added a

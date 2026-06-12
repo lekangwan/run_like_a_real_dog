@@ -2,6 +2,11 @@
 
 Date: 2026-06-11
 
+> Historical note, superseded on 2026-06-12.
+> Read `CURRENT_GAIT_ADAPTATION_PLAN.md` first. The reward-v4 next-step
+> recommendations below predate the selector-only long-run, single-task probe,
+> and fixed-gait live-reward audit requirement.
+
 Read `ACTIVE_PROJECT_CONTEXT.md` and `CONVERSATION_HANDOFF_20260608.md` first.
 This document supersedes the "next steps" section of the 0608 handoff.
 

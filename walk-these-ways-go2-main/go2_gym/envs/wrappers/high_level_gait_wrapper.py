@@ -80,7 +80,7 @@ class HighLevelGaitWrapper:
         self.stance_width_delta_range = stance_width_delta_range
         self.body_pitch_delta_range = body_pitch_delta_range
         self.selector_temperature = selector_temperature
-        self.selector_hold_steps = max(1, int(selector_hold_steps))
+        self.selector_hold_steps = max(0, int(selector_hold_steps))
         self.velocity_tracking_sigma = velocity_tracking_sigma
         self.selector_reference_coef = selector_reference_coef
 
@@ -355,6 +355,9 @@ class HighLevelGaitWrapper:
         )
 
     def _held_selector_weights(self, requested_action):
+        if self.selector_hold_steps == 0:
+            return self._selector_weights(requested_action)
+
         requested_ids = torch.argmax(requested_action[:, : self.num_gaits], dim=-1)
         current_ids = torch.argmax(self.high_level_action[:, : self.num_gaits], dim=-1)
         can_switch = self.selector_hold_counter >= self.selector_hold_steps

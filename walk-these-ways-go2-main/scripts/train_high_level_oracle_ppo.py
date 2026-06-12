@@ -257,6 +257,7 @@ class OracleConditionHighLevelEnv:
         edge_reset_margin=TRAIN_EDGE_RESET_MARGIN,
         teleport_thresh=TRAIN_TELEPORT_THRESH,
         mesh_type=TRAIN_MESH_TYPE,
+        selector_hold_steps=3,
     ):
         self.specs = specs
         self.oracle_condition_obs = oracle_condition_obs
@@ -279,6 +280,7 @@ class OracleConditionHighLevelEnv:
             low_policy,
             record_reward_terms=True,
             selector_reference_coef=0.0,
+            selector_hold_steps=selector_hold_steps,
         )
         self.device = self.env.device
         self.assignment = build_env_assignment(specs, num_envs, self.device)
@@ -456,6 +458,12 @@ def main():
         action="store_true",
         help="Train only the gait categorical head; execute zero continuous residuals and exclude residual log-probs.",
     )
+    parser.add_argument(
+        "--selector-hold-steps",
+        type=int,
+        default=3,
+        help="Minimum high-level steps to hold a selected gait. Use 0 for immediate-switch diagnostics.",
+    )
     args = parser.parse_args()
 
     logdir = find_logdir(args.label, args.run_index)
@@ -472,6 +480,7 @@ def main():
         edge_reset_margin=args.edge_reset_margin,
         teleport_thresh=args.teleport_thresh,
         mesh_type=args.mesh_type,
+        selector_hold_steps=args.selector_hold_steps,
     )
     device = env.device
 
@@ -501,6 +510,13 @@ def main():
         args_dict["obs_dim"] = env.obs_dim
         args_dict["base_obs_dim"] = env.base_obs_dim
         args_dict["aug_obs_dim"] = aug_obs_dim
+        args_dict["target_gait_reward_active"] = any(
+            float(spec.selector_reference_coef) > 0.0 for spec in specs
+        )
+        args_dict["reward_interpretation"] = (
+            "target_gait labels affect the reward only when style_reward_scale "
+            "makes selector_reference_coef > 0; otherwise they are analysis labels."
+        )
         json.dump(args_dict, file, indent=2)
 
     print(f"Saving oracle high-level checkpoints to: {run_dir}")
@@ -509,8 +525,14 @@ def main():
         f"base_obs_dim={env.base_obs_dim} "
         f"priv_dim={args.priv_dim} "
         f"action_dim={env.num_high_level_actions} "
-        f"selector_only={args.selector_only}"
+        f"selector_only={args.selector_only} "
+        f"selector_hold_steps={args.selector_hold_steps}"
     )
+    if args.style_reward_scale == 0.0:
+        print(
+            "WARNING: style_reward_scale=0.0, so target_gait labels are not direct "
+            "selector rewards. This is reward-only training."
+        )
     for task_index, spec in enumerate(specs):
         count = int((env.assignment.task_ids == task_index).sum().item())
         print(
