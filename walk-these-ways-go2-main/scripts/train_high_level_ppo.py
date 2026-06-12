@@ -201,6 +201,17 @@ class ActorCritic(nn.Module):
         value = self.critic(obs).squeeze(-1)
         return action, log_prob, value
 
+    def act_selector_only(self, obs):
+        """Sample only the gait categorical action; residuals are fixed at zero."""
+        gait_dist, _ = self.distribution(obs)
+        gait_id = gait_dist.sample()
+        gait_one_hot = F.one_hot(gait_id, num_classes=self.num_gaits).to(dtype=obs.dtype)
+        residual_action = torch.zeros(obs.shape[0], self.residual_dim, device=obs.device, dtype=obs.dtype)
+        action = torch.cat((gait_one_hot, residual_action), dim=-1)
+        log_prob = gait_dist.log_prob(gait_id)
+        value = self.critic(obs).squeeze(-1)
+        return action, log_prob, value
+
     def evaluate_actions(self, obs, actions):
         gait_dist, residual_dist = self.distribution(obs)
         gait_id = torch.argmax(actions[:, : self.num_gaits], dim=-1)
@@ -210,9 +221,30 @@ class ActorCritic(nn.Module):
         value = self.critic(obs).squeeze(-1)
         return log_prob, entropy, value
 
+    def evaluate_actions_selector_only(self, obs, actions):
+        """Evaluate PPO terms for selector-only mode.
+
+        Residual dimensions may be stored in the rollout buffer as zeros, but
+        they do not contribute to log-probabilities or entropy.
+        """
+        gait_dist, _ = self.distribution(obs)
+        gait_id = torch.argmax(actions[:, : self.num_gaits], dim=-1)
+        log_prob = gait_dist.log_prob(gait_id)
+        entropy = gait_dist.entropy()
+        value = self.critic(obs).squeeze(-1)
+        return log_prob, entropy, value
+
     def act_inference(self, obs):
         """Deterministic forward pass for evaluation / deployment."""
         return self.actor(obs)
+
+    def act_inference_selector_only(self, obs):
+        """Deterministic selector-only forward pass with zero residuals."""
+        gait_logits, _ = self.actor.distribution_params(obs)
+        gait_ids = torch.argmax(gait_logits, dim=-1)
+        gait_one_hot = F.one_hot(gait_ids, num_classes=self.num_gaits).to(dtype=obs.dtype)
+        residual_action = torch.zeros(obs.shape[0], self.residual_dim, device=obs.device, dtype=obs.dtype)
+        return torch.cat((gait_one_hot, residual_action), dim=-1)
 
     def act_student(self, obs):
         """Student-only inference for deployment (no privileged info needed).
@@ -232,6 +264,16 @@ class ActorCritic(nn.Module):
         z = self.adaptation_module(base_obs)
         aug_obs = torch.cat((obs, z), dim=-1)
         return self.actor(aug_obs)
+
+    def act_student_selector_only(self, obs):
+        """Student-only deterministic inference with fixed zero residuals."""
+        if self.z_dim == 0:
+            return self.act_inference_selector_only(obs)
+        base_dim = self.adaptation_module[0].in_features
+        base_obs = obs[:, :base_dim]
+        z = self.adaptation_module(base_obs)
+        aug_obs = torch.cat((obs, z), dim=-1)
+        return self.act_inference_selector_only(aug_obs)
 
 
 class RolloutBuffer:

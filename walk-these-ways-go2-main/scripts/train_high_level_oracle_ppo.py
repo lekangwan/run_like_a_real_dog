@@ -451,6 +451,11 @@ def main():
         default=0.1,
         help="Weight of adaptation MSE loss in total training loss.",
     )
+    parser.add_argument(
+        "--selector-only",
+        action="store_true",
+        help="Train only the gait categorical head; execute zero continuous residuals and exclude residual log-probs.",
+    )
     args = parser.parse_args()
 
     logdir = find_logdir(args.label, args.run_index)
@@ -503,7 +508,8 @@ def main():
         f"obs_dim={env.obs_dim} (+z={args.z_dim} → aug_obs_dim={aug_obs_dim}) "
         f"base_obs_dim={env.base_obs_dim} "
         f"priv_dim={args.priv_dim} "
-        f"action_dim={env.num_high_level_actions}"
+        f"action_dim={env.num_high_level_actions} "
+        f"selector_only={args.selector_only}"
     )
     for task_index, spec in enumerate(specs):
         count = int((env.assignment.task_ids == task_index).sum().item())
@@ -562,7 +568,10 @@ def main():
                 obs_with_z = obs
 
             with torch.inference_mode():
-                action, log_prob, value = model.act(obs_with_z)
+                if args.selector_only:
+                    action, log_prob, value = model.act_selector_only(obs_with_z)
+                else:
+                    action, log_prob, value = model.act(obs_with_z)
                 next_obs, reward, done, info = env.step(action)
 
             buffer.add(obs_with_z, action, log_prob, reward, done, value)
@@ -636,7 +645,13 @@ def main():
             indices = torch.randperm(batch_size, device=device)
             for start in range(0, batch_size, mini_batch_size):
                 idx = indices[start : start + mini_batch_size]
-                new_log_prob, entropy, value = model.evaluate_actions(flat_obs[idx], flat_actions[idx])
+                if args.selector_only:
+                    new_log_prob, entropy, value = model.evaluate_actions_selector_only(
+                        flat_obs[idx],
+                        flat_actions[idx],
+                    )
+                else:
+                    new_log_prob, entropy, value = model.evaluate_actions(flat_obs[idx], flat_actions[idx])
                 ratio = torch.exp(new_log_prob - flat_log_probs[idx])
                 surrogate_1 = ratio * flat_advantages[idx]
                 surrogate_2 = torch.clamp(ratio, 1.0 - args.clip, 1.0 + args.clip) * flat_advantages[idx]
