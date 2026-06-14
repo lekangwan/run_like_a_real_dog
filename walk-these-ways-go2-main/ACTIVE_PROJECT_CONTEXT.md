@@ -9,6 +9,14 @@ Current source-of-truth plan:
 CURRENT_GAIT_ADAPTATION_PLAN.md
 ```
 
+Documentation rule:
+
+```text
+Any change to the training/evaluation plan, any new validation result, and any
+correction to the project interpretation must be recorded in the current project
+documents immediately. Do not leave project-state changes only in chat.
+```
+
 The 2026-06-08 and 2026-06-11 handoff files are historical context. Do not use
 their next-step sections without checking the current plan above.
 
@@ -104,6 +112,9 @@ scripts/train_high_level_ppo.py         reusable high-level PPO components
 scripts/train_high_level_oracle_ppo.py  current oracle-condition sanity trainer
 scripts/evaluate_fixed_gait_live_reward.py
                                          fixed-gait live reward audit
+scripts/evaluate_gait_target_fairness.py
+                                         fair gait target audit with per-gait
+                                         continuous-parameter search
 scripts/play_oracle_policy_training_map.py
                                          learned oracle policy visualization
 scripts/visualize_oracle_training_results.py
@@ -151,20 +162,177 @@ python3 scripts/play_training_scenes_oracle.py --dry-run
 
 ## Next Step
 
-Do not start another soft-prior or curriculum training run yet. The immediate
-next step is a fixed-gait live reward audit:
+The fixed-gait live reward audit has been completed:
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 scripts/evaluate_fixed_gait_live_reward.py \
-  --num-envs 32 \
-  --steps 1000 \
-  --warmup-steps 50
+```text
+runs/high_level_oracle_gait/fixed_gait_live_reward_audit/20260612_221845
 ```
 
-This checks whether the current live reward v4 actually ranks the expected gait
-highest for each task/speed. Only after this audit should we decide between
-reward correction, accepting the live-reward optimum, or adding a soft gait
-prior.
+Main readout:
+
+- flat: live reward agrees with the target gait, trotting
+- ramp/rough: trotting is near-tied with pronking, so selector signal is weak
+- push: live reward prefers trotting; target pacing ranks last
+- stones: live reward prefers pacing; target bounding ranks second
+
+Important interpretation update:
+
+```text
+The target gait labels themselves are not yet fully validated.
+```
+
+The fixed-gait audit used the wrapper default gait templates with continuous
+residuals fixed at zero. It is therefore evidence about the current live reward
+under default continuous parameters, not a fair proof of each gait family's best
+possible task performance.
+
+Per-metric weighted gap decomposition has also been generated:
+
+```text
+runs/high_level_oracle_gait/fixed_gait_live_reward_audit/20260612_221845/weighted_gap_decomposition.md
+runs/high_level_oracle_gait/fixed_gait_live_reward_audit/20260612_221845/weighted_gap_decomposition.csv
+```
+
+Do not continue reward-only selector training, curriculum training, or RMA/no-task
+training as the next diagnostic. Do not implement the proposed reward-v5 weight
+changes yet.
+
+The immediate diagnostic is now a fair target-gait audit:
+
+```text
+For each task/speed/gait, compare the best achievable task score under an equal
+continuous-parameter search budget, using a gait-agnostic objective.
+```
+
+This audit must search continuous gait parameters separately for every
+task/speed/gait combination, not only evaluate `continuous residual = 0`.
+It should report raw metrics, weighted scores, best parameters, and Pareto
+trade-offs. Ambiguous tasks may produce a soft gait distribution instead of a
+single hard target.
+
+Recommended 4090 command:
+
+```bash
+cd /home/lekangwan/run_like_a_real_dog/walk-these-ways-go2-main
+conda activate go2_wtw
+CUDA_VISIBLE_DEVICES=0 python3 scripts/evaluate_gait_target_fairness.py \
+  --full \
+  --grid-mode action-space \
+  --batch-size 32 \
+  --repeats-per-config 2 \
+  --steps 500 \
+  --warmup-steps 100 \
+  --output-dir runs/high_level_oracle_gait/fair_target_gait_audit/20260613_action_grid_full \
+  --skip-existing
+```
+
+Recommended `nohup` background command for SSH sessions:
+
+```bash
+cd /home/lekangwan/run_like_a_real_dog/walk-these-ways-go2-main
+conda activate go2_wtw
+mkdir -p runs/high_level_oracle_gait/fair_target_gait_audit/20260613_action_grid_full
+nohup bash -lc 'CUDA_VISIBLE_DEVICES=0 python3 scripts/evaluate_gait_target_fairness.py \
+  --full \
+  --grid-mode action-space \
+  --batch-size 96 \
+  --repeats-per-config 2 \
+  --steps 500 \
+  --warmup-steps 100 \
+  --output-dir runs/high_level_oracle_gait/fair_target_gait_audit/20260613_action_grid_full \
+  --skip-existing' \
+  > runs/high_level_oracle_gait/fair_target_gait_audit/20260613_action_grid_full/nohup.log 2>&1 &
+```
+
+Monitor it with:
+
+```bash
+tail -f runs/high_level_oracle_gait/fair_target_gait_audit/20260613_action_grid_full/nohup.log
+```
+
+On a 24GB RTX 4090, start with `--batch-size 96 --repeats-per-config 2`
+(`192` envs). If GPU memory still looks very low and simulation is stable, try
+`--batch-size 128 --repeats-per-config 2` (`256` envs). If IsaacGym crashes or
+CUDA OOMs, fall back to `--batch-size 32 --repeats-per-config 2`.
+
+Troubleshooting:
+
+```text
+If the log says "argument --freq-residuals: expected one argument", the server
+has an old `scripts/evaluate_gait_target_fairness.py`. Update the script. The
+fixed version passes negative residual grids to child processes with
+`--freq-residuals=-1.0,0.0,1.0` style syntax.
+
+If the log says "Inplace update to inference tensor outside InferenceMode is not
+allowed", the server has an old fair-audit script that used
+`torch.inference_mode()` around env stepping. Update the script. The fixed
+version uses `torch.no_grad()` for IsaacGym stepping.
+
+If a child runs for a while and then exits with status 1 near the last batch,
+update the script. Older versions recreated IsaacGym with a smaller env count
+for the final partial batch; the fixed version pads the final batch and keeps a
+constant sim/env count for the whole child process.
+
+One observed old-log signature is:
+
+```text
+Finished batch 1/3
+Finished batch 2/3
+AttributeError: 'dict' object has no attribute 'command_curriculum'
+```
+
+This came from rebuilding the IsaacGym/WTW env for the partial final batch after
+the global `Cfg` object had already been mutated. The fixed script avoids that
+rebuild.
+```
+
+Output directory:
+
+```text
+runs/high_level_oracle_gait/fair_target_gait_audit/<timestamp>
+```
+
+Completed result currently available:
+
+```text
+runs/high_level_oracle_gait/fair_target_gait_audit/20260613_action_grid_full
+```
+
+Completeness check:
+
+```text
+fair_gait_grid_results.csv: 4536 data rows
+14 task-speed rows * 4 gaits * 81 action-space parameter settings = 4536
+best_by_task_speed.csv: 14 best rows plus header
+best_by_task_speed_gait.csv: 56 best-per-gait rows plus header
+```
+
+Important coverage note:
+
+```text
+20260613_action_grid_full covers the active task-map training speed rows:
+flat/ramp/rough at 0.5, 1.0, 1.5, 2.0;
+push_lateral at 1.5;
+stepping_stones_easy at 2.0.
+```
+
+In the trainer, because push/stones each have one active training-map speed, the
+runtime sampled command ranges are expanded to:
+
+```text
+push_lateral: [1.2, 1.8]
+stepping_stones_easy: [1.7, 2.0]
+```
+
+Therefore the completed fair audit should be treated as an active-row scan, not
+as a full sampled-range scan for push/stones. To audit the actual sampled ranges,
+run `scripts/evaluate_gait_target_fairness.py --training-range`. To also probe
+extra diagnostic speeds such as push 0.5/1.0/2.0 and stones 1.0/1.5/2.0, run
+with `--extended`.
+
+Only after that audit should the project decide whether to accept the empirical
+best gait, modify the performance reward, or build a score-derived soft gait
+prior. See `CURRENT_GAIT_ADAPTATION_PLAN.md` for the current decision rules.
 
 ## Current Training Entry
 
@@ -216,10 +384,11 @@ the v3 model architecture.
 If oracle-condition training cannot separate the target gaits, do not train the
 final proprioception-only version yet; fix reward/scene design first.
 
-As of 2026-06-12, reward-only v4, selector-only long training, and single-task
+As of 2026-06-13, reward-only v4, selector-only long training, and single-task
 selector-only probes have not proven stable target-gait selector separation.
-The current unresolved question is whether live reward v4 itself ranks the
-target/template gait highest.
+The current unresolved question is whether the target gait labels themselves are
+valid under a fair gait-agnostic evaluation with equal continuous-parameter
+search per gait.
 
 The first 100-iteration oracle run showed a reward-design warning: foot swing
 height increased, but progress and action health slightly worsened. v2 added a
