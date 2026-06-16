@@ -21,6 +21,7 @@ from train_high_level_oracle_ppo import (
     GAIT_NAMES,
     GAIT_SHORT_NAMES,
     OracleConditionHighLevelEnv,
+    REWARD_PROFILE_CHOICES,
     read_task_specs,
 )
 from train_high_level_ppo import find_logdir, load_low_level_policy
@@ -271,6 +272,8 @@ def run_child_audits(args, eval_items, gaits, output_dir):
                 str(args.selector_hold_steps),
                 "--style-reward-scale",
                 str(args.style_reward_scale),
+                "--reward-profile",
+                args.reward_profile,
                 "--output-dir",
                 str(child_dir),
                 "--no-spawn",
@@ -307,6 +310,12 @@ def main():
         help="Keep 0.0 to audit reward-only v4; set >0 only to audit explicit selector shaping.",
     )
     parser.add_argument(
+        "--reward-profile",
+        default="task_focus_v4",
+        choices=REWARD_PROFILE_CHOICES,
+        help="Use task_focus_v4 for legacy per-task weights or unified_* for one shared reward.",
+    )
+    parser.add_argument(
         "--output-dir",
         default=None,
         help="Defaults to runs/high_level_oracle_gait/fixed_gait_live_reward_audit/<timestamp>.",
@@ -315,7 +324,11 @@ def main():
     parser.add_argument("--no-spawn", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    specs = read_task_specs(args.task_map, style_reward_scale=args.style_reward_scale)
+    specs = read_task_specs(
+        args.task_map,
+        style_reward_scale=args.style_reward_scale,
+        reward_profile=args.reward_profile,
+    )
     eval_text = FULL_EVAL if args.full else args.eval
     eval_items = parse_eval_items(eval_text, specs)
     gaits = parse_gaits(args.gaits)

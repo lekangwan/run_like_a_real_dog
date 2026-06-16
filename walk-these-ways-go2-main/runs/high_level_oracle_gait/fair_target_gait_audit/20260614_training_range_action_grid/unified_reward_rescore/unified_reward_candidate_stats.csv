@@ -1,0 +1,5 @@
+candidate,top_gait_counts,margin_counts,mean_margin,mean_top_vx_abs_error,mean_top_fall_rate,mean_top_transport_cost_proxy,mean_top_foot_impact_vel_sum
+balanced,pacing:8 pronking:3 trotting:6,clear_advantage:1 tie_or_noise:8 weak_advantage:8,0.01281119252649698,0.26426415298791495,0.01835294204818852,184.90879353263477,0.6137415161904167
+contact_safety,pacing:14 pronking:1 trotting:2,clear_advantage:3 tie_or_noise:7 weak_advantage:7,0.01913279601376987,0.28105764682678613,0.018823530360618058,182.27083467785414,0.5012161933323916
+efficiency,pacing:8 pronking:1 trotting:8,clear_advantage:2 tie_or_noise:5 weak_advantage:10,0.01673276178262923,0.2722415571265361,0.01864705963388962,179.69952608599547,0.5783986966399586
+robustness,pacing:1 pronking:9 trotting:7,tie_or_noise:13 weak_advantage:4,0.007476234927930233,0.25973665801917806,0.01747058896238313,194.6872693546216,0.7686568112934337

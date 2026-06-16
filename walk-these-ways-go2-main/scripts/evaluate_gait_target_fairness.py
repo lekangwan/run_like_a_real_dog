@@ -23,6 +23,7 @@ from train_high_level_oracle_ppo import (
     GAIT_NAMES,
     GAIT_SHORT_NAMES,
     OracleConditionHighLevelEnv,
+    REWARD_PROFILE_CHOICES,
     read_task_specs,
 )
 from train_high_level_ppo import find_logdir, load_low_level_policy
@@ -908,6 +909,8 @@ def run_child_audits(args, eval_items, output_dir):
             str(args.teleport_thresh),
             "--mesh-type",
             args.mesh_type,
+            "--reward-profile",
+            args.reward_profile,
             f"--freq-residuals={','.join(str(v) for v in args.freq_residuals)}",
             f"--duration-residuals={','.join(str(v) for v in args.duration_residuals)}",
             f"--footswing-residuals={','.join(str(v) for v in args.footswing_residuals)}",
@@ -982,6 +985,15 @@ def main():
     parser.add_argument("--edge-reset-margin", type=float, default=TRAIN_EDGE_RESET_MARGIN)
     parser.add_argument("--teleport-thresh", type=float, default=TRAIN_TELEPORT_THRESH)
     parser.add_argument("--mesh-type", default=TRAIN_MESH_TYPE, choices=["heightfield", "trimesh"])
+    parser.add_argument(
+        "--reward-profile",
+        default="task_focus_v4",
+        choices=REWARD_PROFILE_CHOICES,
+        help=(
+            "Reward profile used for live weighted_metric_reward logging. The fair "
+            "grid's derived neutral scores are still computed from raw metrics."
+        ),
+    )
     parser.add_argument("--freq-residuals", type=parse_floats, default=parse_floats("-1,0,1"))
     parser.add_argument("--duration-residuals", type=parse_floats, default=parse_floats("0"))
     parser.add_argument("--footswing-residuals", type=parse_floats, default=parse_floats("-1,0,1"))
@@ -1013,7 +1025,11 @@ def main():
     parser.add_argument("--no-spawn", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    specs = read_task_specs(args.task_map, style_reward_scale=0.0)
+    specs = read_task_specs(
+        args.task_map,
+        style_reward_scale=0.0,
+        reward_profile=args.reward_profile,
+    )
     if args.extended:
         eval_text = EXTENDED_EVAL
     elif args.training_range:

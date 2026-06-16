@@ -59,6 +59,38 @@ BASE_METRIC_WEIGHTS = {
     "action_boundary_margin": 0.8,
     "survival": 2.0,
 }
+UNIFIED_REWARD_PROFILES = {
+    # Live proxy for the offline `efficiency` re-score:
+    # tracking + energy + impact/smoothness oriented, no task-specific focus.
+    # The wrapper does not yet expose separate impact/scuff scores, so impact is
+    # represented through smoothness/boundary/action-health terms and must be
+    # validated by a live audit before long PPO training.
+    "unified_efficiency": {
+        "progress": 2.0,
+        "yaw_tracking": 0.3,
+        "orientation": 0.8,
+        "lateral_drift": 0.4,
+        "slip": 0.7,
+        "energy": 2.0,
+        "clearance": 0.2,
+        "action_smoothness": 0.8,
+        "action_boundary_margin": 0.5,
+        "survival": 1.5,
+    },
+    "unified_balanced": {
+        "progress": 1.5,
+        "yaw_tracking": 0.3,
+        "orientation": 1.0,
+        "lateral_drift": 0.8,
+        "slip": 1.0,
+        "energy": 1.0,
+        "clearance": 0.5,
+        "action_smoothness": 0.5,
+        "action_boundary_margin": 0.4,
+        "survival": 2.0,
+    },
+}
+REWARD_PROFILE_CHOICES = ("task_focus_v4",) + tuple(UNIFIED_REWARD_PROFILES)
 TASK_REWARD_FOCUS_WEIGHTS = {
     # ── v4: data-driven reward focus ──
     # progress / recovery_progress deliberately REMOVED from focus
@@ -97,7 +129,18 @@ def task_reward_weights_from_focus(reward_focus):
     return [weights[name] for name in HighLevelGaitWrapper.TASK_REWARD_NAMES]
 
 
-def read_task_specs(task_map_path, style_reward_scale=0.0):
+def reward_weights_from_profile(reward_profile, reward_focus):
+    if reward_profile == "task_focus_v4":
+        return task_reward_weights_from_focus(reward_focus)
+    if reward_profile not in UNIFIED_REWARD_PROFILES:
+        raise ValueError(f"Unknown reward_profile={reward_profile!r}")
+    weights = {name: 0.0 for name in HighLevelGaitWrapper.TASK_REWARD_NAMES}
+    for name, value in UNIFIED_REWARD_PROFILES[reward_profile].items():
+        weights[name] = value
+    return [weights[name] for name in HighLevelGaitWrapper.TASK_REWARD_NAMES]
+
+
+def read_task_specs(task_map_path, style_reward_scale=0.0, reward_profile="task_focus_v4"):
     grouped = {}
     with open(task_map_path, newline="") as file:
         for row in csv.DictReader(file):
@@ -140,7 +183,8 @@ def read_task_specs(task_map_path, style_reward_scale=0.0):
                 style_reward_strength=item["style_reward_strength"],
                 selector_reference_coef=style_reward_scale * STYLE_COEFS[item["style_reward_strength"]],
                 reward_focus=item["reward_focus"],
-                task_reward_weights=task_reward_weights_from_focus(item["reward_focus"]),
+                reward_profile=reward_profile,
+                task_reward_weights=reward_weights_from_profile(reward_profile, item["reward_focus"]),
                 vx_values=vx_values,
                 vx_low=vx_low,
                 vx_high=vx_high,
@@ -440,6 +484,16 @@ def main():
         default=0.0,
         help="Scale for gait-label selector reward. Default 0 disables hard gait-label shaping.",
     )
+    parser.add_argument(
+        "--reward-profile",
+        default="task_focus_v4",
+        choices=REWARD_PROFILE_CHOICES,
+        help=(
+            "High-level metric weighting. task_focus_v4 keeps the legacy per-task "
+            "reward_focus weights; unified_* uses one terrain-agnostic weight vector "
+            "for every task."
+        ),
+    )
     parser.add_argument("--z-dim", type=int, default=16, help="Environment latent dimension for RMA distillation.")
     parser.add_argument(
         "--priv-dim",
@@ -467,7 +521,11 @@ def main():
     args = parser.parse_args()
 
     logdir = find_logdir(args.label, args.run_index)
-    specs = read_task_specs(args.task_map, style_reward_scale=args.style_reward_scale)
+    specs = read_task_specs(
+        args.task_map,
+        style_reward_scale=args.style_reward_scale,
+        reward_profile=args.reward_profile,
+    )
     low_policy = load_low_level_policy(logdir)
     env = OracleConditionHighLevelEnv(
         specs,
@@ -517,6 +575,10 @@ def main():
             "target_gait labels affect the reward only when style_reward_scale "
             "makes selector_reference_coef > 0; otherwise they are analysis labels."
         )
+        args_dict["reward_profile_note"] = (
+            "task_focus_v4 uses task-map reward_focus weights; unified_* profiles "
+            "use the same metric weights for every terrain/task."
+        )
         json.dump(args_dict, file, indent=2)
 
     print(f"Saving oracle high-level checkpoints to: {run_dir}")
@@ -538,7 +600,8 @@ def main():
         print(
             f"task={spec.task_id} condition={spec.condition} target={spec.target_gait} "
             f"envs={count} vx=[{spec.vx_low:.2f},{spec.vx_high:.2f}] "
-            f"style_coef={spec.selector_reference_coef:.2f} focus={spec.reward_focus}"
+            f"style_coef={spec.selector_reference_coef:.2f} "
+            f"reward_profile={spec.reward_profile} focus={spec.reward_focus}"
         )
 
     for iteration in range(args.iterations):

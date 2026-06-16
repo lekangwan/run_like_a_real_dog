@@ -18,10 +18,18 @@ The high-level policy should:
   stance width, and body pitch,
 - eventually remove oracle task labels and rely on RMA/proprioceptive evidence.
 
-The active project goal is visible condition-driven gait behavior, not proving
-that one gait is universally best. If live reward evidence says the current
-training objective prefers a different gait from the task-map label, that is a
-reward-design finding, not automatically a PPO failure.
+The active project goal is useful condition-aware locomotion adaptation under a
+unified physical objective. Visible condition-driven gait-family switching is an
+important behavior to measure, but it is not the only success criterion.
+
+A unified reward may rationally lead the policy to use a globally robust gait
+family and adapt mostly through continuous gait parameters. If that improves
+tracking, stability, energy, impact, and OOD behavior, it is a valid project
+result rather than an automatic failure.
+
+Do not force gait differentiation by hard-tuning per-terrain reward weights or
+gait priors. Per-terrain reward profiles and score-derived gait priors are
+diagnostics/ablations, not the default generalization claim.
 
 ## Active Code Path
 
@@ -494,14 +502,206 @@ per-gait continuous-parameter search.
 ## Immediate Next Step
 
 Do not continue reward-only selector training, curriculum training, or RMA/no-task
-training as the next diagnostic. Also do not implement reward v5 yet.
+training as the next diagnostic. Also do not implement per-terrain reward v5 or
+a gait prior yet.
 
-The immediate next diagnostic is a fair target-gait audit:
+The immediate next step is offline unified-reward re-scoring:
+
+```text
+Use the completed fair gait grid as an offline dataset and re-score all
+task-speed-gait-parameter rows with several unified, terrain-agnostic physical
+reward candidates.
+```
+
+Candidate families:
+
+```text
+A. balanced:
+   tracking + stability + energy + impact + slip/scuff with comparable weights
+
+B. efficiency-oriented:
+   heavier tracking, energy, impact, and action smoothness
+
+C. robustness-oriented:
+   heavier survival, orientation, lateral recovery, slip/scuff
+
+D. contact-safety-oriented:
+   heavier scuff, clearance/contact safety, impact, slip
+```
+
+Selection criteria:
+
+```text
+- not whether the result matches old target_gait labels;
+- whether raw metrics and Pareto trade-offs are physically reasonable;
+- whether the reward collapses every condition to one gait for bad reasons;
+- whether continuous parameters vary sensibly with speed/condition;
+- whether top1-top2 margins are large enough to provide a learnable signal.
+```
+
+If a unified reward prefers mostly one gait plus continuous-parameter adaptation,
+do not call that a failure by default. It becomes a valid hypothesis:
+
+```text
+Under a unified physical objective, adaptation may emerge primarily through
+continuous gait-parameter tuning, with discrete gait switching appearing only
+where it is actually useful.
+```
+
+Offline unified-reward re-scoring has been implemented and run:
+
+```text
+scripts/offline_rescore_unified_reward.py
+runs/high_level_oracle_gait/fair_target_gait_audit/20260614_training_range_action_grid/unified_reward_rescore
+```
+
+Outputs:
+
+```text
+summary.md
+candidate_selection.md
+candidate_weights.json
+unified_reward_candidate_stats.csv
+unified_reward_decisions.csv
+unified_reward_best_by_task_speed.csv
+unified_reward_best_by_task_speed_gait.csv
+unified_reward_soft_distribution.csv
+unified_reward_top1_top2_metric_gaps.csv
+```
+
+Candidate readout:
+
+```text
+efficiency: primary candidate. Best overall energy among the candidates,
+            relatively low impact, useful margins, and no total gait collapse.
+
+balanced: secondary candidate. Middle-ground trade-off, but some low-speed
+          flat/ramp pacing choices need live-audit scrutiny.
+
+robustness: diagnostic only. Best mean vx/fall numbers, but margins are mostly
+            tie/noise and energy/impact are worst.
+
+contact_safety: reject as mainline. It overweights contact/scuff/impact enough
+                to collapse to pacing in 14/17 task-speed rows.
+```
+
+Efficiency ranking by task/speed after per-gait best-parameter selection:
+
+```text
+flat 0.5: pace > trot > pronk > bound
+flat 1.0: trot > pronk > pace > bound
+flat 1.5: trot > pace > pronk > bound
+flat 2.0: trot > pronk > pace > bound
+
+push 1.2: trot > pronk > bound > pace
+push 1.5: trot > pronk > pace > bound
+push 1.8: trot > pronk > pace > bound
+
+ramp 0.5: pace > trot > pronk > bound
+ramp 1.0: pace > trot > pronk > bound
+ramp 1.5: pronk > pace > trot > bound
+ramp 2.0: trot > pronk > pace > bound
+
+rough 0.5: pace ~= trot > pronk > bound
+rough 1.0: pace > pronk > trot > bound
+rough 1.5: pace > trot > pronk > bound
+rough 2.0: trot > pace > pronk > bound
+
+stones 1.7: pace > pronk > bound > trot
+stones 2.0: pace > trot > bound > pronk
+```
+
+Implementation status:
+
+```text
+scripts/train_high_level_oracle_ppo.py now supports:
+  --reward-profile task_focus_v4
+  --reward-profile unified_efficiency
+  --reward-profile unified_balanced
+
+scripts/evaluate_fixed_gait_live_reward.py and
+scripts/evaluate_gait_target_fairness.py also accept the same flag, so live
+audits and PPO training can use matching metric weights.
+```
+
+Important caveat:
+
+```text
+unified_efficiency is a live proxy for the offline efficiency score. The offline
+score used separate impact/scuff scores from the fair-grid raw metrics; the live
+wrapper currently represents those pressures indirectly through action-health,
+boundary, clearance, and smoothness terms. Therefore a live reward audit is
+required before long PPO training.
+```
+
+Next validation step:
+
+```text
+Run fixed-gait live reward audit with --reward-profile unified_efficiency and
+compare the live ranking against the offline efficiency re-score. If the result
+is not wildly inconsistent, start a short no-task PPO run with the same reward
+profile. Keep unified_balanced as the second candidate if efficiency looks too
+biased in live rollouts.
+```
+
+Recommended live-audit command:
+
+```bash
+cd /home/lekangwan/run_like_a_real_dog/walk-these-ways-go2-main
+conda activate go2_wtw
+CUDA_VISIBLE_DEVICES=0 python3 scripts/evaluate_fixed_gait_live_reward.py \
+  --full \
+  --gaits all \
+  --num-envs 32 \
+  --steps 1000 \
+  --warmup-steps 50 \
+  --reward-profile unified_efficiency \
+  --output-dir runs/high_level_oracle_gait/fixed_gait_live_reward_audit/20260615_unified_efficiency
+```
+
+If this live audit is broadly consistent, short PPO smoke-run command:
+
+```bash
+cd /home/lekangwan/run_like_a_real_dog/walk-these-ways-go2-main
+conda activate go2_wtw
+CUDA_VISIBLE_DEVICES=0 python3 scripts/train_high_level_oracle_ppo.py \
+  --run-name 20260615_unified_efficiency_notask_smoke \
+  --iterations 50 \
+  --save-interval 25 \
+  --adaptation-coef 0.1 \
+  --reward-profile unified_efficiency \
+  --style-reward-scale 0.0 \
+  --no-oracle-condition-obs
+```
+
+The completed fair gait audit remains the diagnostic basis:
+
+```text
+runs/high_level_oracle_gait/fair_target_gait_audit/20260614_training_range_action_grid
+```
+
+Historical fair-audit objective:
 
 ```text
 For each task/speed/gait, evaluate the best achievable task score under an equal
 continuous-parameter search budget, using a gait-agnostic task objective.
 ```
+
+Historical fair-audit procedure:
+
+```text
+1. scan the actual sampled training command range;
+2. for each task, speed, and gait, find that gait's best continuous parameters
+   under the same search budget;
+3. compare gait families as fairly as possible at each task/speed point;
+4. inspect top-vs-second margins, raw metric gaps, and Pareto trade-offs;
+5. use the result as diagnostic evidence for unified reward design, not as an
+   automatic task-labeled gait target generator.
+```
+
+Reward adjustment should be downstream of the fair audit, but the next reward
+candidate should still be unified and terrain-agnostic unless a later ablation
+explicitly tests stronger task priors.
 
 The audit should compare gait families without using `target_gait` as a label
 and without hard-coding contact-style preferences. It should answer:
@@ -740,6 +940,29 @@ CUDA_VISIBLE_DEVICES=3 PYTHONPATH=$PWD/scripts:$PWD python3 -B scripts/evaluate_
   --skip-existing
 ```
 
+Interpretation guardrails:
+
+```text
+--training-range is a representative-point audit for the sampled training
+ranges. It is closer to the actual trainer than --full for push/stones, but it
+is still not an integral over the continuous command distribution.
+
+--extended is diagnostic only. Speeds outside the current training distribution
+should reveal whether gait preference is speed-dependent, but they should not be
+used directly as training targets unless the training curriculum is deliberately
+expanded.
+```
+
+If the fair audit shows that gait ranking changes with speed, do not use a
+single task-level target gait. The target/prior should become:
+
+```text
+target_distribution = f(condition, cmd_vx)
+```
+
+This is especially important for push and stepping stones, where a fixed
+task-level label such as `push -> pace` or `stones -> bound` may be too coarse.
+
 The fair audit may produce a soft distribution rather than a one-hot target:
 
 ```text
@@ -756,6 +979,184 @@ A. accept the live reward optimum, even if push becomes trot and stones becomes 
 B. modify the performance reward so the intended gait is actually live-best;
 C. add a score-derived soft gait prior, using template/live score evidence rather
    than hard-coded task labels.
+```
+
+### training-range fair audit result
+
+Completed run:
+
+```text
+runs/high_level_oracle_gait/fair_target_gait_audit/20260614_training_range_action_grid
+```
+
+Primary comparison artifacts:
+
+```text
+fair_best_continuous_params_comparison.md
+fair_best_continuous_params_comparison.csv
+fair_task_speed_gait_decision_analysis.md
+fair_task_speed_gait_decisions.csv
+fair_task_speed_soft_distribution.csv
+fair_top1_top2_metric_gaps.csv
+```
+
+These files are the intended interpretation layer. For every task-speed-gait,
+the audit first selects that gait family's best continuous-parameter setting
+under the equal action-space grid. Gait-family comparison is then made only
+between those per-gait optima. This scan should not be interpreted as directly
+searching for a pre-existing hand-written target gait.
+
+`fair_task_speed_gait_decision_analysis.md` is the compact decision table. It
+uses the following margin heuristic:
+
+```text
+neutral margin < 0.01: tie/noise -> keep soft
+0.01 <= margin < 0.03: weak advantage -> soft preference
+margin >= 0.03: clearer advantage -> sharp soft or hard only after raw-metric review
+```
+
+`fair_top1_top2_metric_gaps.csv` is the next reward-design diagnostic. It shows
+which raw metrics make the top gait win or lose relative to the second-best gait
+after both have received their own best continuous parameters.
+
+Metric-level readout:
+
+```text
+Many neutral-score winners are not uniformly better. They often win via
+lateral/scuff/progress-style terms while losing on energy, impact, or tracking.
+
+Pronk frequently beats trot by lateral/scuff terms, but often costs more energy
+and impact.
+
+Trot is clearly healthier at flat 2.0 and rough 2.0, where it improves tracking
+and/or efficiency against the runner-up.
+
+Push is not evidence for pacing. It is mostly a pronk-vs-trot trade-off, and
+at push 1.8 the live reward already prefers trot over the neutral-score winner.
+
+Stones 1.7 is effectively ambiguous. Stones 2.0 favors pacing on tracking,
+impact, and energy, but it pays lateral/fall trade-offs.
+```
+
+Coverage:
+
+```text
+17 task-speed points:
+flat/ramp/rough at 0.5, 1.0, 1.5, 2.0
+push_lateral at 1.2, 1.5, 1.8
+stepping_stones at 1.7, 2.0
+
+68 task-speed-gait groups * 81 action-space parameter settings = 5508 configs
+```
+
+Neutral-score best gait by task-speed:
+
+```text
+These winners are comparisons between each gait's own best continuous-parameter
+setting, not wrapper-default gait comparisons.
+
+flat 0.5: pronking, but trotting is very close
+flat 1.0: pronking, but trotting is very close
+flat 1.5: trotting, pronking close
+flat 2.0: trotting, clearer margin
+
+ramp 0.5/1.0/1.5/2.0: pronking, with trotting consistently second
+
+rough 0.5/1.0/1.5: pronking, with trotting close
+rough 2.0: trotting
+
+push 1.2/1.5/1.8: pronking, with trotting close; pacing is not supported
+
+stones 1.7/2.0: pacing; bounding is not supported as one-hot best
+```
+
+Interpretation:
+
+```text
+The old hard task-map labels are not supported as final one-hot targets.
+```
+
+Important 2026-06-15 interpretation correction:
+
+```text
+Do not automatically convert the fair audit into task-labeled gait targets.
+The fair audit is primarily a diagnostic tool. It tells us which gait families
+are Pareto competitive after each gait receives its own best continuous
+parameters under the same search budget, and which physical metrics create the
+trade-offs.
+```
+
+For generalization, the preferred final training objective should be a unified
+terrain-agnostic performance reward, not per-terrain reward profiles. Per-terrain
+reward weights and score-derived gait priors are both human priors. They may be
+useful for diagnostics or ablations, but they should not be treated as the
+default final solution if the goal is proprioception-based adaptation to unseen
+terrain.
+
+The next design question is:
+
+```text
+Can one unified reward, with fixed weights on physical performance metrics such
+as tracking, stability, slip/scuff, impact, energy, and survival, produce useful
+condition-dependent gait/parameter choices?
+```
+
+Preferred order:
+
+```text
+1. first improve the universal physical metric definitions and weights;
+2. only use condition dependence if it comes from continuous/observable physical
+   variables rather than task labels;
+3. use score-derived soft gait priors only as an ablation or fallback, not as
+   the default generalization claim.
+```
+
+## Updated Technical Route
+
+Mainline:
+
+```text
+1. Offline re-score the completed fair grid with several unified reward
+   candidates.
+2. Choose 1-2 unified reward candidates based on raw metric trade-offs, not old
+   target gait labels.
+3. Implement the chosen unified reward in the live wrapper and run a fixed/fair
+   reward audit to confirm offline/live consistency.
+4. Train PPO with no task one-hot and no gait prior.
+5. Evaluate both discrete gait ratios and continuous parameter adaptation on
+   in-distribution and OOD terrain.
+```
+
+Mainline success criteria:
+
+```text
+- improved tracking, stability, survival, energy, impact, slip/scuff, and route
+  behavior;
+- sensible continuous parameter changes with speed/condition;
+- gait-family switching if it naturally helps, but not required everywhere;
+- OOD performance does not depend on explicit task labels.
+```
+
+Diagnostic/ablation route:
+
+```text
+- task_onehot oracle: checks whether the reward/action space can support
+  condition-specific behavior when condition information is explicit;
+- selector-only: checks discrete selector credit assignment without continuous
+  residual shortcuts;
+- per-terrain reward profile: upper-bound/diagnostic for task priors, not a
+  generalization claim;
+- score-derived soft gait prior: weak-supervision ablation or fallback if unified
+  reward cannot provide a learnable selector signal.
+```
+
+Interpretation rule:
+
+```text
+If the mainline learns mostly one gait family plus useful continuous-parameter
+adaptation, report that honestly. It may mean discrete gait switching is not
+necessary under the chosen unified physical objective, rather than that the
+project failed.
 ```
 
 ## Proposed Reward v5 Candidate

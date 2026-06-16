@@ -1,0 +1,28 @@
+Importing module 'gym_38' (/home/kaiqiang/lekang/isaacgym/python/isaacgym/_bindings/linux-x86_64/gym_38.so)
+Setting GYM_USD_PLUG_INFO_PATH to /home/kaiqiang/lekang/isaacgym/python/isaacgym/_bindings/linux-x86_64/usd/plugInfo.json
+PyTorch version 2.4.1+cu121
+Device count 1
+/home/kaiqiang/lekang/isaacgym/python/isaacgym/_bindings/src/gymtorch
+Using /home/kaiqiang/.cache/torch_extensions/py38_cu121 as PyTorch extensions root...
+Emitting ninja build file /home/kaiqiang/.cache/torch_extensions/py38_cu121/gymtorch/build.ninja...
+Building extension module gymtorch...
+Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+ninja: no work to do.
+[Warning] [carb.gym.plugin] useGpuPipeline is set, forcing GPU PhysX
+Not connected to PVD
++++ Using GPU PhysX
+Physics Engine: PhysX
+Physics Device: cuda:0
+GPU Pipeline: enabled
+Loading extension module gymtorch...
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+/home/kaiqiang/miniconda3/envs/go2_wtw/lib/python3.8/site-packages/torch/functional.py:513: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at ../aten/src/ATen/native/TensorShape.cpp:3609.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+Creating mixed oracle env: num_envs=768, mesh_type=trimesh, terrain_size=12.0m, edge_reset_margin=1.5m
+Fair gait audit: task=ramp_up_trot_robustness vx=2.00 configs=324 batch_size=384 repeats=2
+Finished batch 1/1: rows=324 batch=282.7s elapsed=4.7m eta=0.0m configs/s=1.15
+
+Wrote fair audit to: runs/high_level_oracle_gait/fair_target_gait_audit/20260614_training_range_action_grid/ramp_up_trot_robustness_vx2p00
