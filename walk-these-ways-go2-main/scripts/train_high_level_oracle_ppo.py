@@ -2,6 +2,7 @@ import argparse
 import csv
 import gc
 import json
+from collections import defaultdict
 from pathlib import Path
 import pickle as pkl
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from go2_gym.envs.go2.go2_config import config_go2
 from go2_gym.envs.go2.velocity_tracking import VelocityTrackingEasyEnv
 from go2_gym.envs.wrappers.history_wrapper import HistoryWrapper
 from go2_gym.envs.wrappers.high_level_gait_wrapper import HighLevelGaitWrapper
+from go2_gym.envs.wrappers.high_level_reward_metrics import UNIFIED_REWARD_PROFILES
 from gait_conditions import DIRECTED_PUSH_INTERVAL_S, apply_condition_cfg
 from gait_project_config import (
     MAINLINE_TASK_MAP,
@@ -59,38 +61,17 @@ BASE_METRIC_WEIGHTS = {
     "action_boundary_margin": 0.8,
     "survival": 2.0,
 }
-UNIFIED_REWARD_PROFILES = {
-    # Live proxy for the offline `efficiency` re-score:
-    # tracking + energy + impact/smoothness oriented, no task-specific focus.
-    # The wrapper does not yet expose separate impact/scuff scores, so impact is
-    # represented through smoothness/boundary/action-health terms and must be
-    # validated by a live audit before long PPO training.
-    "unified_efficiency": {
-        "progress": 2.0,
-        "yaw_tracking": 0.3,
-        "orientation": 0.8,
-        "lateral_drift": 0.4,
-        "slip": 0.7,
-        "energy": 2.0,
-        "clearance": 0.2,
-        "action_smoothness": 0.8,
-        "action_boundary_margin": 0.5,
-        "survival": 1.5,
-    },
-    "unified_balanced": {
-        "progress": 1.5,
-        "yaw_tracking": 0.3,
-        "orientation": 1.0,
-        "lateral_drift": 0.8,
-        "slip": 1.0,
-        "energy": 1.0,
-        "clearance": 0.5,
-        "action_smoothness": 0.5,
-        "action_boundary_margin": 0.4,
-        "survival": 2.0,
-    },
-}
 REWARD_PROFILE_CHOICES = ("task_focus_v4",) + tuple(UNIFIED_REWARD_PROFILES)
+REWARD_PROFILE_STATUS = {
+    "task_focus_v4": "validated_for_training",
+    "unified_efficiency": "diagnostic_only_incomplete_proxy",
+    "unified_balanced": "diagnostic_only_incomplete_proxy",
+    "canonical_efficiency_candidate": "diagnostic_only_unvalidated_candidate",
+    "canonical_balanced_candidate": "diagnostic_only_unvalidated_candidate",
+    "canonical_efficiency_v2_candidate": "diagnostic_only_unvalidated_candidate",
+    "canonical_efficiency_v3_physical": "diagnostic_only_unvalidated_candidate",
+    "canonical_efficiency_v4_physical": "diagnostic_only_unvalidated_candidate",
+}
 TASK_REWARD_FOCUS_WEIGHTS = {
     # ── v4: data-driven reward focus ──
     # progress / recovery_progress deliberately REMOVED from focus
@@ -229,6 +210,87 @@ def build_env_assignment(specs, num_envs, device):
         push_axes=push_axes,
         task_reward_weights=torch.tensor(task_reward_weights, device=device, dtype=torch.float),
     )
+
+
+class SelectorTargetTable:
+    def __init__(self, rows_by_task_index, device, num_gaits, min_confidence=0.0):
+        self.rows_by_task_index = rows_by_task_index
+        self.device = device
+        self.num_gaits = num_gaits
+        self.min_confidence = float(min_confidence)
+
+    def lookup(self, task_ids, cmd_vx):
+        probs = torch.zeros(task_ids.shape[0], self.num_gaits, device=self.device)
+        weights = torch.zeros(task_ids.shape[0], device=self.device)
+        for task_index, rows in self.rows_by_task_index.items():
+            mask = task_ids == task_index
+            if not torch.any(mask):
+                continue
+            speed_points = rows["speed_points"]
+            nearest = torch.argmin(torch.abs(cmd_vx[mask, None] - speed_points[None, :]), dim=1)
+            task_probs = rows["probs"][nearest]
+            task_weights = rows["confidence"][nearest]
+            task_weights = torch.where(
+                task_weights >= self.min_confidence,
+                task_weights,
+                torch.zeros_like(task_weights),
+            )
+            probs[mask] = task_probs
+            weights[mask] = task_weights
+        return probs, weights
+
+
+def load_selector_target_table(path, specs, device, num_gaits, min_confidence=0.0):
+    if path is None:
+        return None
+    path = Path(path)
+    task_index_by_id = {spec.task_id: index for index, spec in enumerate(specs)}
+    grouped = defaultdict(list)
+    with open(path, newline="") as file:
+        for row in csv.DictReader(file):
+            task_id = row["task_id"]
+            if task_id not in task_index_by_id:
+                continue
+            probs = [float(row[gait]) for gait in GAIT_NAMES]
+            prob_sum = sum(probs)
+            if prob_sum <= 0.0:
+                continue
+            probs = [value / prob_sum for value in probs]
+            grouped[task_index_by_id[task_id]].append(
+                {
+                    "cmd_vx": float(row["cmd_vx"]),
+                    "probs": probs,
+                    "confidence": float(row.get("confidence", 1.0)),
+                }
+            )
+
+    rows_by_task_index = {}
+    for task_index, rows in grouped.items():
+        rows = sorted(rows, key=lambda item: item["cmd_vx"])
+        rows_by_task_index[task_index] = {
+            "speed_points": torch.tensor(
+                [item["cmd_vx"] for item in rows],
+                device=device,
+                dtype=torch.float,
+            ),
+            "probs": torch.tensor(
+                [item["probs"] for item in rows],
+                device=device,
+                dtype=torch.float,
+            ),
+            "confidence": torch.tensor(
+                [item["confidence"] for item in rows],
+                device=device,
+                dtype=torch.float,
+            ),
+        }
+
+    missing = [spec.task_id for index, spec in enumerate(specs) if index not in rows_by_task_index]
+    if missing:
+        raise ValueError(
+            f"Selector target table {path} is missing task rows for: {', '.join(missing)}"
+        )
+    return SelectorTargetTable(rows_by_task_index, device, num_gaits, min_confidence=min_confidence)
 
 
 def load_mixed_low_level_env(
@@ -490,8 +552,9 @@ def main():
         choices=REWARD_PROFILE_CHOICES,
         help=(
             "High-level metric weighting. task_focus_v4 keeps the legacy per-task "
-            "reward_focus weights; unified_* uses one terrain-agnostic weight vector "
-            "for every task."
+            "reward_focus weights. unified_* are historical diagnostic proxies. "
+            "canonical_*_candidate profiles are terrain-agnostic candidates that "
+            "must be validated before default PPO training."
         ),
     )
     parser.add_argument("--z-dim", type=int, default=16, help="Environment latent dimension for RMA distillation.")
@@ -518,7 +581,46 @@ def main():
         default=3,
         help="Minimum high-level steps to hold a selected gait. Use 0 for immediate-switch diagnostics.",
     )
+    parser.add_argument(
+        "--selector-targets",
+        default=None,
+        help=(
+            "CSV produced by build_soft_selector_targets.py. When set together "
+            "with selector_aux_coef > 0, the gait selector is weakly guided by "
+            "task/speed-dependent reference probabilities."
+        ),
+    )
+    parser.add_argument(
+        "--selector-aux-coef",
+        type=float,
+        default=0.0,
+        help="Small loss weight for matching selector logits to selector_targets.",
+    )
+    parser.add_argument(
+        "--selector-aux-min-confidence",
+        type=float,
+        default=0.0,
+        help="Ignore selector target rows whose confidence is below this value.",
+    )
+    parser.add_argument("--allow-diagnostic-reward-profile", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--allow-incomplete-live-reward",
+        action="store_true",
+        dest="allow_diagnostic_reward_profile",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
+
+    reward_status = REWARD_PROFILE_STATUS.get(args.reward_profile, "unknown")
+    if reward_status != "validated_for_training" and not args.allow_diagnostic_reward_profile:
+        raise RuntimeError(
+            f"Refusing to train with reward_profile={args.reward_profile!r}. "
+            f"Current status: {reward_status}. "
+            "Only profiles marked validated_for_training are accepted by default. "
+            "First pass the same-trajectory online/offline consistency check, "
+            "then rerun fair continuous-parameter audits and live audits. Pass "
+            "--allow-diagnostic-reward-profile only for a deliberate diagnostic."
+        )
 
     logdir = find_logdir(args.label, args.run_index)
     specs = read_task_specs(
@@ -541,6 +643,14 @@ def main():
         selector_hold_steps=args.selector_hold_steps,
     )
     device = env.device
+    selector_target_table = load_selector_target_table(
+        args.selector_targets,
+        specs,
+        device,
+        env.num_gaits,
+        min_confidence=args.selector_aux_min_confidence,
+    )
+    use_selector_targets = selector_target_table is not None and args.selector_aux_coef > 0.0
 
     model = ActorCritic(
         env.obs_dim,
@@ -571,9 +681,15 @@ def main():
         args_dict["target_gait_reward_active"] = any(
             float(spec.selector_reference_coef) > 0.0 for spec in specs
         )
+        args_dict["selector_target_training_active"] = use_selector_targets
         args_dict["reward_interpretation"] = (
             "target_gait labels affect the reward only when style_reward_scale "
             "makes selector_reference_coef > 0; otherwise they are analysis labels."
+        )
+        args_dict["selector_target_note"] = (
+            "selector_targets, when active, add a separate small training loss on "
+            "the gait selector logits. They do not change the environment reward "
+            "and do not directly constrain continuous residual actions."
         )
         args_dict["reward_profile_note"] = (
             "task_focus_v4 uses task-map reward_focus weights; unified_* profiles "
@@ -588,8 +704,15 @@ def main():
         f"priv_dim={args.priv_dim} "
         f"action_dim={env.num_high_level_actions} "
         f"selector_only={args.selector_only} "
-        f"selector_hold_steps={args.selector_hold_steps}"
+        f"selector_hold_steps={args.selector_hold_steps} "
+        f"selector_target_training={use_selector_targets}"
     )
+    if use_selector_targets:
+        print(
+            f"Using selector target table: {args.selector_targets} "
+            f"coef={args.selector_aux_coef:.4f} "
+            f"min_confidence={args.selector_aux_min_confidence:.3f}"
+        )
     if args.style_reward_scale == 0.0:
         print(
             "WARNING: style_reward_scale=0.0, so target_gait labels are not direct "
@@ -636,8 +759,14 @@ def main():
         gait_switch_penalty_sum = 0.0
         action_boundary_penalty_sum = 0.0
         adaptation_loss_sum = 0.0
+        selector_aux_loss_sum = 0.0
+        selector_aux_weight_sum = 0.0
+        selector_aux_target_entropy_sum = 0.0
+        selector_aux_pred_entropy_sum = 0.0
         metric_score_sums = {name: 0.0 for name in HighLevelGaitWrapper.TASK_REWARD_NAMES}
         actual_actions = []
+        selector_target_probs_steps = []
+        selector_target_weights_steps = []
 
         for _ in range(args.num_steps):
             # ── RMA: compute z_input (skip when z_dim == 0) ──
@@ -651,6 +780,14 @@ def main():
                 obs_with_z = torch.cat((obs, z_input), dim=-1)
             else:
                 obs_with_z = obs
+
+            if use_selector_targets:
+                target_probs, target_weights = selector_target_table.lookup(
+                    env.assignment.task_ids,
+                    env.command_vx(),
+                )
+                selector_target_probs_steps.append(target_probs.detach().clone())
+                selector_target_weights_steps.append(target_weights.detach().clone())
 
             with torch.inference_mode():
                 if args.selector_only:
@@ -713,6 +850,15 @@ def main():
 
         flat_obs, flat_actions, flat_log_probs, flat_returns, flat_advantages, _ = buffer.flat()
         actual_actions_flat = torch.stack(actual_actions, dim=0).reshape(-1, env.num_high_level_actions)
+        if use_selector_targets:
+            flat_selector_target_probs = torch.stack(selector_target_probs_steps, dim=0).reshape(
+                -1,
+                env.num_gaits,
+            )
+            flat_selector_target_weights = torch.stack(selector_target_weights_steps, dim=0).reshape(-1)
+        else:
+            flat_selector_target_probs = None
+            flat_selector_target_weights = None
         batch_size = flat_obs.shape[0]
         mini_batch_size = max(1, batch_size // args.mini_batches)
 
@@ -754,11 +900,39 @@ def main():
                 else:
                     adaptation_loss = torch.tensor(0.0, device=device)
 
+                if use_selector_targets:
+                    gait_logits, _ = model.actor.distribution_params(flat_obs[idx])
+                    gait_log_probs = torch.nn.functional.log_softmax(gait_logits, dim=-1)
+                    gait_probs = torch.exp(gait_log_probs)
+                    target_probs = flat_selector_target_probs[idx]
+                    target_weights = flat_selector_target_weights[idx]
+                    weighted_count = target_weights.sum()
+                    selector_ce = -(target_probs * gait_log_probs).sum(dim=-1)
+                    if weighted_count.item() > 0.0:
+                        selector_aux_loss = (selector_ce * target_weights).sum() / (weighted_count + 1e-8)
+                        target_entropy = (
+                            -(target_probs * torch.clamp(target_probs, min=1e-8).log()).sum(dim=-1)
+                            * target_weights
+                        ).sum() / (weighted_count + 1e-8)
+                        pred_entropy = (
+                            -(gait_probs * gait_log_probs).sum(dim=-1) * target_weights
+                        ).sum() / (weighted_count + 1e-8)
+                    else:
+                        selector_aux_loss = torch.tensor(0.0, device=device)
+                        target_entropy = torch.tensor(0.0, device=device)
+                        pred_entropy = torch.tensor(0.0, device=device)
+                else:
+                    selector_aux_loss = torch.tensor(0.0, device=device)
+                    target_entropy = torch.tensor(0.0, device=device)
+                    pred_entropy = torch.tensor(0.0, device=device)
+                    target_weights = None
+
                 loss = (
                     policy_loss
                     + args.value_coef * value_loss
                     - args.entropy_coef * entropy_loss
                     + args.adaptation_coef * adaptation_loss
+                    + args.selector_aux_coef * selector_aux_loss
                 )
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -769,6 +943,11 @@ def main():
                 policy_loss_epoch += policy_loss.item()
                 entropy_epoch += entropy_loss.item()
                 adaptation_loss_epoch += adaptation_loss.item()
+                selector_aux_loss_sum += selector_aux_loss.item()
+                selector_aux_target_entropy_sum += target_entropy.item()
+                selector_aux_pred_entropy_sum += pred_entropy.item()
+                if use_selector_targets:
+                    selector_aux_weight_sum += target_weights.mean().item()
                 updates += 1
 
         # ── compute z statistics for logging (skip when z_dim == 0) ──
@@ -805,6 +984,10 @@ def main():
             "value_loss": value_loss_epoch / updates,
             "entropy": entropy_epoch / updates,
             "adaptation_loss": adaptation_loss_epoch / updates,
+            "selector_aux_loss": selector_aux_loss_sum / updates,
+            "selector_aux_weight_mean": selector_aux_weight_sum / updates if use_selector_targets else 0.0,
+            "selector_aux_target_entropy": selector_aux_target_entropy_sum / updates,
+            "selector_aux_pred_entropy": selector_aux_pred_entropy_sum / updates,
             "alpha": alpha_val,
             "z_teacher_mean": z_teacher_mean,
             "z_teacher_std": z_teacher_std,
@@ -829,6 +1012,7 @@ def main():
             f"switch={metrics['gait_switch_rate']:.3f} "
             f"metric={metrics['weighted_metric_reward']:.3f} "
             f"adapt={metrics['adaptation_loss']:.4f} "
+            f"sel_ref={metrics['selector_aux_loss']:.4f} "
             f"z_err={metrics['z_error']:.4f} "
             f"flat_trot={metrics.get('flat_trot_efficiency_trot_ratio', float('nan')):.2f} "
             f"push_pace={metrics.get('push_lateral_pace_recovery_pace_ratio', float('nan')):.2f} "
@@ -844,7 +1028,11 @@ def main():
             flat_advantages,
             actual_actions_flat,
             actual_actions,
+            selector_target_probs_steps,
+            selector_target_weights_steps,
         )
+        if use_selector_targets:
+            del flat_selector_target_probs, flat_selector_target_weights
         if use_rma:
             del base_obs_all, priv_obs_all, priv_obs_flat
         gc.collect()

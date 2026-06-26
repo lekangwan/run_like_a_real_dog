@@ -22,4 +22,5 @@ go2_gym_deploy/unitree_sdk2_bin/library/unitree_sdk2/build/
 
 logs/
 
-runs/high_level_oracle_gait/smoke*
+# runs/high_level_oracle_gait/smoke*
+runs/

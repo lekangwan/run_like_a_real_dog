@@ -1,5 +1,12 @@
 import torch
 
+from go2_gym.envs.wrappers.high_level_reward_metrics import (
+    CANONICAL_REWARD_NAMES,
+    compute_metric_score_dict,
+    compute_weighted_metric_reward,
+    stack_metric_scores,
+)
+
 
 class HighLevelGaitWrapper:
     """Wrap a WTW env + frozen low-level policy as a high-level gait-parameter env.
@@ -13,24 +20,7 @@ class HighLevelGaitWrapper:
       8: residual body pitch
     """
 
-    TASK_REWARD_NAMES = (
-        "progress",
-        "yaw_tracking",
-        "orientation",
-        "pitch_rate",
-        "roll_rate",
-        "yaw_rate",
-        "lateral_drift",
-        "vertical_bounce",
-        "slip",
-        "energy",
-        "clearance",
-        "gait_stability",
-        "action_smoothness",
-        "action_magnitude",
-        "action_boundary_margin",
-        "survival",
-    )
+    TASK_REWARD_NAMES = CANONICAL_REWARD_NAMES
 
     def __init__(
         self,
@@ -40,6 +30,7 @@ class HighLevelGaitWrapper:
         history_length=10,
         action_smoothing=0.6,
         record_reward_terms=False,
+        record_reward_primitives=False,
         freq_range=(2.0, 3.5),
         duration_range=(0.42, 0.58),
         phase_range=(0.0, 0.5),
@@ -65,6 +56,7 @@ class HighLevelGaitWrapper:
         self.history_length = history_length
         self.action_smoothing = action_smoothing
         self.record_reward_terms = record_reward_terms
+        self.record_reward_primitives = record_reward_primitives
 
         self.phase_range = phase_range
         self.offset_range = offset_range
@@ -174,12 +166,20 @@ class HighLevelGaitWrapper:
         )
         self.low_level_obs = None
         self.last_reward_terms = {}
+        self.last_reward_primitives = {}
+        self.prev_foot_contacts = torch.zeros(
+            self.num_envs,
+            4,
+            device=self.device,
+            dtype=torch.bool,
+        )
         self.target_gait_ids = None
         self.selector_reference_coef_tensor = None
         self.task_reward_weights = None
 
     def reset(self):
         self.low_level_obs = self.env.reset()
+        self.prev_foot_contacts = self._current_foot_contacts()
         self.high_level_action.copy_(self.default_high_level_action)
         self.prev_high_level_action.copy_(self.default_high_level_action)
         self.selector_hold_counter.fill_(self.selector_hold_steps)
@@ -228,6 +228,11 @@ class HighLevelGaitWrapper:
                 "orientation_penalty": torch.zeros(self.num_envs, device=self.device),
                 "torque_penalty": torch.zeros(self.num_envs, device=self.device),
                 "slip_penalty": torch.zeros(self.num_envs, device=self.device),
+                "contact_slip_penalty": torch.zeros(self.num_envs, device=self.device),
+                "mechanical_power_abs": torch.zeros(self.num_envs, device=self.device),
+                "transport_cost_proxy": torch.zeros(self.num_envs, device=self.device),
+                "impact_velocity_rms": torch.zeros(self.num_envs, device=self.device),
+                "scuffing_ratio": torch.zeros(self.num_envs, device=self.device),
                 "action_delta_penalty": torch.zeros(self.num_envs, device=self.device),
                 "continuous_action_penalty": torch.zeros(self.num_envs, device=self.device),
                 "action_boundary_penalty": torch.zeros(self.num_envs, device=self.device),
@@ -247,6 +252,7 @@ class HighLevelGaitWrapper:
             }
             for name in self.TASK_REWARD_NAMES:
                 reward_terms[f"score_{name}"] = torch.zeros(self.num_envs, device=self.device)
+        reward_primitives = [] if self.record_reward_primitives else None
 
         for _ in range(self.low_level_steps):
             self._apply_high_level_action()
@@ -257,6 +263,13 @@ class HighLevelGaitWrapper:
             if self.record_reward_terms:
                 for key, value in self.last_reward_terms.items():
                     reward_terms[key] += value
+            if self.record_reward_primitives:
+                reward_primitives.append(
+                    {
+                        key: value.detach().clone()
+                        for key, value in self.last_reward_primitives.items()
+                    }
+                )
             dones_accum |= dones.bool()
             del low_action
 
@@ -272,6 +285,8 @@ class HighLevelGaitWrapper:
             for key in reward_terms:
                 reward_terms[key] /= self.low_level_steps
             info["high_level_reward_terms"] = reward_terms
+        if self.record_reward_primitives:
+            info["high_level_reward_primitives"] = reward_primitives
         return self.get_observations(), rewards, dones_accum, info
 
     def get_observations(self):
@@ -453,9 +468,19 @@ class HighLevelGaitWrapper:
         orientation_penalty = torch.sum(self.env.projected_gravity[:, :2] ** 2, dim=1)
         torque_penalty = torch.mean(self.env.torques**2, dim=1) / 100.0
 
-        contacts = self.env.contact_forces[:, self.env.feet_indices, 2] > 1.0
+        contacts = self._current_foot_contacts()
+        contacts_f = contacts.float()
+        contact_count = torch.sum(contacts_f, dim=1)
         foot_xy_vel = torch.sum(self.env.foot_velocities[:, :, :2] ** 2, dim=2)
         slip_penalty = torch.mean(contacts * foot_xy_vel, dim=1)
+        contact_slip_penalty = torch.sum(contacts_f * foot_xy_vel, dim=1) / torch.clamp(
+            contact_count, min=1.0
+        )
+        impact_velocity_rms, scuffing_ratio = self._compute_contact_safety_terms(contacts)
+        joint_power = self.env.torques * self.env.dof_vel[:, : self.env.torques.shape[1]]
+        mechanical_power_abs = torch.sum(torch.abs(joint_power), dim=1)
+        forward_speed_for_cost = torch.clamp(torch.abs(self.env.base_lin_vel[:, 0]), min=0.3)
+        transport_cost_proxy = mechanical_power_abs / forward_speed_for_cost
 
         action_delta_penalty = torch.mean(
             (self.high_level_action - self.prev_high_level_action) ** 2, dim=1
@@ -510,13 +535,18 @@ class HighLevelGaitWrapper:
             lateral_position_penalty=lateral_position_penalty,
             vertical_velocity_penalty=vertical_velocity_penalty,
             slip_penalty=slip_penalty,
+            contact_slip_penalty=contact_slip_penalty,
             torque_penalty=torque_penalty,
+            mechanical_power_abs=mechanical_power_abs,
+            transport_cost_proxy=transport_cost_proxy,
             clearance_reward=clearance_reward,
             gait_switch_penalty=gait_switch_penalty,
             action_delta_penalty=action_delta_penalty,
             continuous_action_penalty=continuous_action_penalty,
             action_boundary_penalty=action_boundary_penalty,
             fall_penalty=fall_penalty,
+            impact_velocity_rms=impact_velocity_rms,
+            scuffing_ratio=scuffing_ratio,
         )
         weighted_metric_reward = self._compute_weighted_metric_reward(metric_scores)
         if self.record_reward_terms:
@@ -526,6 +556,11 @@ class HighLevelGaitWrapper:
                 "orientation_penalty": orientation_penalty,
                 "torque_penalty": torque_penalty,
                 "slip_penalty": slip_penalty,
+                "contact_slip_penalty": contact_slip_penalty,
+                "mechanical_power_abs": mechanical_power_abs,
+                "transport_cost_proxy": transport_cost_proxy,
+                "impact_velocity_rms": impact_velocity_rms,
+                "scuffing_ratio": scuffing_ratio,
                 "action_delta_penalty": action_delta_penalty,
                 "continuous_action_penalty": continuous_action_penalty,
                 "action_boundary_penalty": action_boundary_penalty,
@@ -546,6 +581,34 @@ class HighLevelGaitWrapper:
             for i, name in enumerate(self.TASK_REWARD_NAMES):
                 self.last_reward_terms[f"score_{name}"] = metric_scores[:, i]
 
+        if self.record_reward_primitives:
+            self.last_reward_primitives = {
+                "velocity_reward": velocity_reward,
+                "yaw_reward": yaw_reward,
+                "orientation_penalty": orientation_penalty,
+                "pitch_rate_penalty": pitch_rate_penalty,
+                "roll_rate_penalty": roll_rate_penalty,
+                "yaw_rate_penalty": yaw_rate_penalty,
+                "lateral_velocity_penalty": lateral_velocity_penalty,
+                "lateral_position_penalty": lateral_position_penalty,
+                "vertical_velocity_penalty": vertical_velocity_penalty,
+                "slip_penalty": slip_penalty,
+                "contact_slip_penalty": contact_slip_penalty,
+                "torque_penalty": torque_penalty,
+                "mechanical_power_abs": mechanical_power_abs,
+                "transport_cost_proxy": transport_cost_proxy,
+                "clearance_reward": clearance_reward,
+                "gait_switch_penalty": gait_switch_penalty,
+                "action_delta_penalty": action_delta_penalty,
+                "continuous_action_penalty": continuous_action_penalty,
+                "action_boundary_penalty": action_boundary_penalty,
+                "fall_penalty": fall_penalty,
+                "impact_velocity_rms": impact_velocity_rms,
+                "scuffing_ratio": scuffing_ratio,
+            }
+
+        self.prev_foot_contacts = contacts.detach().clone()
+
         return weighted_metric_reward - selector_reference_coef * selector_reference_penalty
 
     def _compute_metric_scores(
@@ -560,41 +623,47 @@ class HighLevelGaitWrapper:
         lateral_position_penalty,
         vertical_velocity_penalty,
         slip_penalty,
+        contact_slip_penalty,
         torque_penalty,
+        mechanical_power_abs,
+        transport_cost_proxy,
         clearance_reward,
         gait_switch_penalty,
         action_delta_penalty,
         continuous_action_penalty,
         action_boundary_penalty,
         fall_penalty,
+        impact_velocity_rms=None,
+        scuffing_ratio=None,
     ):
-        return torch.stack(
-            (
-                velocity_reward,
-                yaw_reward,
-                torch.exp(-orientation_penalty / 0.05),
-                torch.exp(-pitch_rate_penalty / 0.25),
-                torch.exp(-roll_rate_penalty / 0.25),
-                torch.exp(-yaw_rate_penalty / 0.25),
-                torch.exp(-lateral_velocity_penalty / 0.05 - lateral_position_penalty / 1.00),
-                torch.exp(-vertical_velocity_penalty / 0.05),
-                torch.exp(-slip_penalty / 0.05),
-                torch.exp(-torque_penalty / 0.50),
-                clearance_reward,
-                torch.exp(-gait_switch_penalty / 0.25),
-                torch.exp(-action_delta_penalty / 0.05),
-                torch.exp(-continuous_action_penalty / 0.25),
-                torch.exp(-action_boundary_penalty / 0.25),
-                1.0 - fall_penalty,
-            ),
-            dim=1,
+        score_dict = compute_metric_score_dict(
+            velocity_reward=velocity_reward,
+            yaw_reward=yaw_reward,
+            orientation_penalty=orientation_penalty,
+            pitch_rate_penalty=pitch_rate_penalty,
+            roll_rate_penalty=roll_rate_penalty,
+            yaw_rate_penalty=yaw_rate_penalty,
+            lateral_velocity_penalty=lateral_velocity_penalty,
+            lateral_position_penalty=lateral_position_penalty,
+            vertical_velocity_penalty=vertical_velocity_penalty,
+            slip_penalty=slip_penalty,
+            contact_slip_penalty=contact_slip_penalty,
+            torque_penalty=torque_penalty,
+            mechanical_power_abs=mechanical_power_abs,
+            transport_cost_proxy=transport_cost_proxy,
+            clearance_reward=clearance_reward,
+            gait_switch_penalty=gait_switch_penalty,
+            action_delta_penalty=action_delta_penalty,
+            continuous_action_penalty=continuous_action_penalty,
+            action_boundary_penalty=action_boundary_penalty,
+            fall_penalty=fall_penalty,
+            impact_velocity_rms=impact_velocity_rms,
+            scuffing_ratio=scuffing_ratio,
         )
+        return stack_metric_scores(score_dict, self.TASK_REWARD_NAMES)
 
     def _compute_weighted_metric_reward(self, scores):
-        if self.task_reward_weights is None:
-            return torch.mean(scores, dim=1)
-        weight_sum = torch.sum(self.task_reward_weights, dim=1).clamp(min=1e-6)
-        return torch.sum(self.task_reward_weights * scores, dim=1) / weight_sum
+        return compute_weighted_metric_reward(scores, self.task_reward_weights)
 
     def __getattr__(self, name):
         return getattr(self.env, name)
@@ -621,6 +690,53 @@ class HighLevelGaitWrapper:
         if edge_reset is None:
             return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         return edge_reset.to(device=self.device, dtype=torch.bool)
+
+    def _current_foot_contacts(self):
+        return self.env.contact_forces[:, self.env.feet_indices, 2] > 1.0
+
+    def _compute_contact_safety_terms(self, contacts):
+        prev_contacts = self.prev_foot_contacts.to(device=self.device, dtype=torch.bool)
+        new_contacts = contacts & (~prev_contacts)
+        prev_foot_velocities = getattr(self.env, "prev_foot_velocities", self.env.foot_velocities)
+        impact_vel = torch.clamp(-prev_foot_velocities[:, :, 2], min=0.0)
+        impact_vel_sq = torch.sum(new_contacts.float() * impact_vel**2, dim=1)
+        impact_count = torch.sum(new_contacts.float(), dim=1)
+        impact_velocity_rms = torch.sqrt(impact_vel_sq / torch.clamp(impact_count, min=1.0))
+
+        foot_positions = getattr(self.env, "foot_positions", None)
+        if foot_positions is None:
+            scuffing_ratio = torch.zeros(self.num_envs, device=self.device)
+            return impact_velocity_rms, scuffing_ratio
+
+        ground_heights = self._sample_ground_heights(foot_positions)
+        foot_clearance = foot_positions[:, :, 2] - ground_heights
+        swing_mask = (~contacts).float()
+        swing_count = torch.clamp(torch.sum(swing_mask, dim=1), min=1.0)
+        scuffing_ratio = torch.sum(swing_mask * (foot_clearance < 0.035).float(), dim=1) / swing_count
+        return impact_velocity_rms, scuffing_ratio
+
+    def _sample_ground_heights(self, foot_positions):
+        base_env = self._get_base_env()
+        if not hasattr(base_env, "height_samples") or not hasattr(base_env, "terrain"):
+            return torch.zeros_like(foot_positions[:, :, 2])
+
+        height_samples = base_env.height_samples
+        terrain_cfg = base_env.terrain.cfg
+        points = foot_positions[:, :, :2] + terrain_cfg.border_size
+        px = torch.clamp(
+            (points[:, :, 0] / terrain_cfg.horizontal_scale).long(),
+            0,
+            height_samples.shape[0] - 2,
+        )
+        py = torch.clamp(
+            (points[:, :, 1] / terrain_cfg.horizontal_scale).long(),
+            0,
+            height_samples.shape[1] - 2,
+        )
+        heights1 = height_samples[px, py]
+        heights2 = height_samples[px + 1, py]
+        heights3 = height_samples[px, py + 1]
+        return torch.minimum(torch.minimum(heights1, heights2), heights3) * terrain_cfg.vertical_scale
 
     def _get_selector_reference_coef(self):
         if self.selector_reference_coef_tensor is not None:

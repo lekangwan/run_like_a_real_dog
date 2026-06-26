@@ -435,6 +435,10 @@ def make_stats(num_envs, device):
         "gravity_y_sq": torch.zeros(num_envs, device=device),
         "torque_penalty": torch.zeros(num_envs, device=device),
         "slip_penalty": torch.zeros(num_envs, device=device),
+        "contact_slip_penalty": torch.zeros(num_envs, device=device),
+        "reward_impact_velocity_rms": torch.zeros(num_envs, device=device),
+        "reward_mechanical_power_abs": torch.zeros(num_envs, device=device),
+        "reward_transport_cost_proxy": torch.zeros(num_envs, device=device),
         "mechanical_power_abs": torch.zeros(num_envs, device=device),
         "positive_mechanical_power": torch.zeros(num_envs, device=device),
         "contact_force_mean": torch.zeros(num_envs, device=device),
@@ -497,14 +501,35 @@ def add_step_stats(stats, env, action, reward, done, info, prev_contacts):
     stats["gravity_x_sq"] += high_env.projected_gravity[:, 0] ** 2
     stats["gravity_y_sq"] += high_env.projected_gravity[:, 1] ** 2
 
-    torque_penalty = torch.mean(high_env.torques**2, dim=1) / 100.0
+    torque_penalty = terms.get(
+        "torque_penalty",
+        torch.mean(high_env.torques**2, dim=1) / 100.0,
+    )
     foot_xy_vel = torch.sum(high_env.foot_velocities[:, :, :2] ** 2, dim=2)
-    slip_penalty = torch.mean(contacts * foot_xy_vel, dim=1)
+    slip_penalty = terms.get("slip_penalty", torch.mean(contacts * foot_xy_vel, dim=1))
+    contact_slip_fallback = torch.sum(contacts.float() * foot_xy_vel, dim=1) / torch.clamp(
+        contact_count, min=1.0
+    )
+    contact_slip_penalty = terms.get("contact_slip_penalty", contact_slip_fallback)
     stats["torque_penalty"] += torque_penalty
     stats["slip_penalty"] += slip_penalty
+    stats["contact_slip_penalty"] += contact_slip_penalty
+    stats["reward_impact_velocity_rms"] += terms.get(
+        "impact_velocity_rms",
+        torch.zeros_like(torque_penalty),
+    )
 
     joint_power = high_env.torques * high_env.dof_vel[:, : high_env.torques.shape[1]]
-    stats["mechanical_power_abs"] += torch.sum(torch.abs(joint_power), dim=1)
+    mechanical_power_abs = torch.sum(torch.abs(joint_power), dim=1)
+    stats["mechanical_power_abs"] += mechanical_power_abs
+    stats["reward_mechanical_power_abs"] += terms.get(
+        "mechanical_power_abs",
+        mechanical_power_abs,
+    )
+    stats["reward_transport_cost_proxy"] += terms.get(
+        "transport_cost_proxy",
+        mechanical_power_abs / torch.clamp(torch.abs(high_env.base_lin_vel[:, 0]), min=0.3),
+    )
     stats["positive_mechanical_power"] += torch.sum(torch.clamp(joint_power, min=0.0), dim=1)
 
     contact_force_norm = torch.norm(high_env.contact_forces[:, high_env.feet_indices, :], dim=2)
@@ -522,7 +547,10 @@ def add_step_stats(stats, env, action, reward, done, info, prev_contacts):
     swing_mask = (~contacts).float()
     swing_count = torch.clamp(torch.sum(swing_mask, dim=1), min=1.0)
     stats["swing_foot_clearance_mean"] += torch.sum(swing_mask * foot_clearance, dim=1) / swing_count
-    stats["scuffing_ratio"] += torch.sum(swing_mask * (foot_clearance < 0.035).float(), dim=1) / swing_count
+    measured_scuffing_ratio = torch.sum(
+        swing_mask * (foot_clearance < 0.035).float(), dim=1
+    ) / swing_count
+    stats["scuffing_ratio"] += terms.get("scuffing_ratio", measured_scuffing_ratio)
 
     if prev_contacts is not None:
         new_contacts = contacts & (~prev_contacts)
@@ -692,10 +720,63 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
-def softmax_by_score(rows, temperature):
+def read_config_rows(path):
+    rows = []
+    with Path(path).open(newline="") as file:
+        for raw in csv.DictReader(file):
+            row = dict(raw)
+            if "gait_id" not in row or row["gait_id"] == "":
+                row["gait_id"] = GAIT_NAMES.index(row["gait"])
+            else:
+                row["gait_id"] = int(float(row["gait_id"]))
+            for name in BEHAVIOR_NAMES:
+                key = f"{name}_residual"
+                if key not in row or row[key] == "":
+                    raise ValueError(f"Config row is missing required column {key!r}: {row}")
+                row[key] = float(row[key])
+                if name in row and row[name] != "":
+                    row[name] = float(row[name])
+            if "cmd_vx" in row and row["cmd_vx"] != "":
+                row["cmd_vx"] = float(row["cmd_vx"])
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"No config rows found in {path}")
+    return rows
+
+
+def config_eval_items(config_rows, specs):
+    by_task = {spec.task_id: spec for spec in specs}
+    items = []
+    seen = set()
+    for row in config_rows:
+        task_id = row.get("task_id")
+        if task_id not in by_task:
+            raise ValueError(f"Unknown task_id={task_id!r} in config CSV")
+        vx = float(row["cmd_vx"])
+        key = (task_id, vx)
+        if key not in seen:
+            seen.add(key)
+            items.append((by_task[task_id], vx))
+    return items
+
+
+def filter_config_rows(config_rows, spec, vx):
+    rows = []
+    for row in config_rows:
+        if row.get("task_id") != spec.task_id:
+            continue
+        if abs(float(row.get("cmd_vx", vx)) - float(vx)) > 1e-6:
+            continue
+        rows.append(dict(row))
+    if not rows:
+        raise ValueError(f"No config rows found for task={spec.task_id} vx={vx}")
+    return rows
+
+
+def softmax_by_score(rows, temperature, score_key):
     if not rows:
         return {}
-    scores = torch.tensor([float(row["neutral_score"]) for row in rows], dtype=torch.float)
+    scores = torch.tensor([float(row[score_key]) for row in rows], dtype=torch.float)
     probs = torch.softmax((scores - torch.max(scores)) / max(temperature, 1e-6), dim=0)
     return {rows[i]["gait"]: float(probs[i].item()) for i in range(len(rows))}
 
@@ -704,7 +785,7 @@ def fmt(value):
     return f"{float(value):.3f}"
 
 
-def write_summary(path, rows, temperature):
+def write_summary(path, rows, temperature, selection_score_key):
     grouped = {}
     for row in rows:
         grouped.setdefault((row["task_id"], float(row["cmd_vx"])), []).append(row)
@@ -713,23 +794,24 @@ def write_summary(path, rows, temperature):
         "# Fair Target-Gait Audit",
         "",
         "This audit gives every gait an equal continuous-parameter search budget.",
-        "It reports neutral weighted scores, raw metrics, and Pareto candidates.",
+        f"It ranks rows by `{selection_score_key}` and reports raw metrics plus Pareto candidates.",
         "",
     ]
     for (task_id, vx), group in sorted(grouped.items()):
-        best_by_gait = best_rows(group, ["gait"])
-        ranked = sorted(best_by_gait, key=lambda row: float(row["neutral_score"]), reverse=True)
-        probs = softmax_by_score(ranked, temperature)
+        best_by_gait = best_rows(group, ["gait"], score_key=selection_score_key)
+        ranked = sorted(best_by_gait, key=lambda row: float(row[selection_score_key]), reverse=True)
+        probs = softmax_by_score(ranked, temperature, selection_score_key)
         lines += [
             f"## {task_id} vx={vx:.2f}",
             "",
             f"- target_gait_from_task_map: `{ranked[0]['target_gait']}`",
-            f"- best_gait_by_neutral_score: `{ranked[0]['gait']}`",
+            f"- selection_score_key: `{selection_score_key}`",
+            f"- best_gait_by_selection_score: `{ranked[0]['gait']}`",
             "- soft_distribution_from_best_per_gait: "
             + ", ".join(f"{gait}={probs[gait]:.3f}" for gait in probs),
             "",
-            "| rank | gait | neutral | live_weighted | vx_err | fall | lateral | scuff | impact | energy | params |",
-            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+            "| rank | gait | selected | neutral | live_weighted | vx_err | fall | lateral | scuff | impact | torque | cot_proxy | params |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
         for rank, row in enumerate(ranked, start=1):
             params = (
@@ -741,13 +823,15 @@ def write_summary(path, rows, temperature):
             )
             lines.append(
                 f"| {rank} | {row['gait']} "
+                f"| {fmt(row[selection_score_key])} "
                 f"| {fmt(row['neutral_score'])} "
                 f"| {fmt(row['weighted_metric_reward_mean'])} "
                 f"| {fmt(row['vx_abs_error_mean'])} "
                 f"| {fmt(row['fall_rate'])} "
                 f"| {fmt(row['lateral_offset_abs_mean'])} "
                 f"| {fmt(row['scuffing_ratio_mean'])} "
-                f"| {fmt(row['foot_impact_vel_rms'])} "
+                f"| {fmt(row.get('reward_impact_velocity_rms_mean', row['foot_impact_vel_rms']))} "
+                f"| {fmt(row['torque_penalty_mean'])} "
                 f"| {fmt(row['transport_cost_proxy'])} "
                 f"| {params} |"
             )
@@ -757,14 +841,14 @@ def write_summary(path, rows, temperature):
 
 def save_outputs(output_dir, rows, args):
     output_dir.mkdir(parents=True, exist_ok=True)
-    best_by_gait = best_rows(rows, ["task_id", "cmd_vx", "gait"])
-    best_by_task = best_rows(rows, ["task_id", "cmd_vx"])
+    best_by_gait = best_rows(rows, ["task_id", "cmd_vx", "gait"], score_key=args.selection_score_key)
+    best_by_task = best_rows(rows, ["task_id", "cmd_vx"], score_key=args.selection_score_key)
     front = pareto_front(rows)
     write_csv(output_dir / "fair_gait_grid_results.csv", rows)
     write_csv(output_dir / "best_by_task_speed_gait.csv", best_by_gait)
     write_csv(output_dir / "best_by_task_speed.csv", best_by_task)
     write_csv(output_dir / "pareto_front.csv", front)
-    write_summary(output_dir / "summary.md", rows, args.softmax_temperature)
+    write_summary(output_dir / "summary.md", rows, args.softmax_temperature, args.selection_score_key)
     config = vars(args).copy()
     config["output_dir"] = str(output_dir)
     with (output_dir / "run_config.json").open("w") as file:
@@ -774,11 +858,18 @@ def save_outputs(output_dir, rows, args):
 def run_eval_item(args, spec, vx, output_dir):
     logdir = find_logdir(args.label, args.run_index)
     low_policy = load_low_level_policy(logdir)
+    effective_num_envs = args.batch_size * args.repeats_per_config
+    print(
+        f"Creating fair-audit env: task={spec.task_id} vx={vx:.2f} "
+        f"effective_num_envs={effective_num_envs} "
+        f"(batch_size={args.batch_size} * repeats={args.repeats_per_config})",
+        flush=True,
+    )
     env = OracleConditionHighLevelEnv(
         [spec],
         logdir,
         low_policy,
-        args.batch_size * args.repeats_per_config,
+        effective_num_envs,
         render=args.render,
         oracle_condition_obs=False,
         terrain_size=args.terrain_size,
@@ -789,7 +880,9 @@ def run_eval_item(args, spec, vx, output_dir):
     )
 
     gaits = parse_gaits(args.gaits)
-    if args.grid_mode == "action-space":
+    if args.config_csv:
+        grid = filter_config_rows(read_config_rows(args.config_csv), spec, vx)
+    elif args.grid_mode == "action-space":
         grid = build_action_space_grid(env, args, gaits)
     else:
         grid = build_physical_grid(env, args, gaits)
@@ -844,6 +937,8 @@ def run_eval_item(args, spec, vx, output_dir):
             args.repeats_per_config,
             args.steps,
         )
+        for row in finalized:
+            row["validation_seed"] = args.seed
         rows.extend(finalized[:real_batch_size])
         if args.save_each_batch:
             save_outputs(output_dir, rows, args)
@@ -925,10 +1020,16 @@ def run_child_audits(args, eval_items, output_dir):
             str(args.start_index),
             "--softmax-temperature",
             str(args.softmax_temperature),
+            "--selection-score-key",
+            args.selection_score_key,
+            "--seed",
+            str(args.seed),
             "--output-dir",
             str(child_dir),
             "--no-spawn",
         ]
+        if args.config_csv:
+            cmd.extend(["--config-csv", args.config_csv])
         if args.max_configs is not None:
             cmd.extend(["--max-configs", str(args.max_configs)])
         if args.render:
@@ -975,8 +1076,31 @@ def main():
         help="Audit extra push/stones speeds outside the current training range for diagnosis.",
     )
     parser.add_argument("--gaits", default="all")
+    parser.add_argument(
+        "--config-csv",
+        default=None,
+        help=(
+            "Optional CSV of explicit task/speed/gait/residual configs to evaluate. "
+            "When provided with --eval-from-config, eval task-speed pairs are inferred "
+            "from the CSV."
+        ),
+    )
+    parser.add_argument(
+        "--eval-from-config",
+        action="store_true",
+        help="Infer eval task-speed pairs from --config-csv.",
+    )
     parser.add_argument("--grid-mode", choices=("action-space", "physical"), default="action-space")
-    parser.add_argument("--num-envs", type=int, default=64, help="Kept for command metadata.")
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=64,
+        help=(
+            "Kept for command metadata only. Fair-audit simulation env count is "
+            "batch_size * repeats_per_config because each env executes one "
+            "config repeat."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=32, help="Parameter configs per sim batch.")
     parser.add_argument("--repeats-per-config", type=int, default=2)
     parser.add_argument("--steps", type=int, default=500)
@@ -1008,6 +1132,16 @@ def main():
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--max-configs", type=int, default=None)
     parser.add_argument("--softmax-temperature", type=float, default=0.03)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--selection-score-key",
+        default="neutral_score",
+        choices=("neutral_score", "weighted_metric_reward_mean"),
+        help=(
+            "Score used to select best rows in best_by_* outputs and summary. "
+            "Use weighted_metric_reward_mean when validating a live reward profile."
+        ),
+    )
     parser.add_argument(
         "--output-dir",
         default=None,
@@ -1024,21 +1158,31 @@ def main():
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--no-spawn", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     specs = read_task_specs(
         args.task_map,
         style_reward_scale=0.0,
         reward_profile=args.reward_profile,
     )
-    if args.extended:
+    if args.eval_from_config:
+        if not args.config_csv:
+            raise ValueError("--eval-from-config requires --config-csv")
+        eval_items = config_eval_items(read_config_rows(args.config_csv), specs)
+    elif args.extended:
         eval_text = EXTENDED_EVAL
+        eval_items = parse_eval_items(eval_text, specs)
     elif args.training_range:
         eval_text = TRAINING_RANGE_EVAL
+        eval_items = parse_eval_items(eval_text, specs)
     elif args.full:
         eval_text = FULL_EVAL
+        eval_items = parse_eval_items(eval_text, specs)
     else:
         eval_text = args.eval
-    eval_items = parse_eval_items(eval_text, specs)
+        eval_items = parse_eval_items(eval_text, specs)
     output_dir = (
         Path(args.output_dir)
         if args.output_dir
