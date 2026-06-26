@@ -2,6 +2,8 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import subprocess
+import sys
 import time
 
 import isaacgym
@@ -230,6 +232,96 @@ def write_item_summary(path, summaries):
         writer.writerows(summaries)
 
 
+def child_dir_name(task_id, vx):
+    return f"{task_id}_vx{vx:.2f}".replace(".", "p")
+
+
+def combine_child_outputs(output_dir, child_dirs, metadata_overrides):
+    all_data = {}
+    summaries = []
+    first_metadata = None
+    for child_dir in child_dirs:
+        child_dir = Path(child_dir)
+        data = np.load(child_dir / "info_path_samples.npz", allow_pickle=True)
+        for key in data.files:
+            all_data.setdefault(key, []).append(data[key])
+        with (child_dir / "collection_summary.csv").open(newline="") as file:
+            summaries.extend(csv.DictReader(file))
+        if first_metadata is None:
+            first_metadata = json.loads((child_dir / "metadata.json").read_text())
+
+    arrays = {key: np.concatenate(values, axis=0) for key, values in all_data.items()}
+    np.savez_compressed(output_dir / "info_path_samples.npz", **arrays)
+    write_item_summary(output_dir / "collection_summary.csv", summaries)
+
+    metadata = dict(first_metadata or {})
+    metadata.update(metadata_overrides)
+    metadata["num_samples"] = int(arrays["task_index"].shape[0])
+    metadata["child_dirs"] = [str(Path(path)) for path in child_dirs]
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+
+
+def run_child_collections(args, eval_items, output_dir):
+    child_dirs = []
+    for spec, _task_index, vx in eval_items:
+        child_dir = output_dir / child_dir_name(spec.task_id, vx)
+        child_dirs.append(child_dir)
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--run-dir",
+            args.run_dir,
+            "--label",
+            args.label,
+            "--run-index",
+            str(args.run_index),
+            "--task-map",
+            args.task_map,
+            "--eval",
+            f"{spec.task_id}:{vx}",
+            "--num-envs",
+            str(args.num_envs),
+            "--samples-per-item",
+            str(args.samples_per_item),
+            "--warmup-steps",
+            str(args.warmup_steps),
+            "--max-steps",
+            str(args.max_steps),
+            "--sample-interval",
+            str(args.sample_interval),
+            "--terrain-size",
+            str(args.terrain_size),
+            "--edge-reset-margin",
+            str(args.edge_reset_margin),
+            "--teleport-thresh",
+            str(args.teleport_thresh),
+            "--mesh-type",
+            args.mesh_type,
+            "--output-dir",
+            str(child_dir),
+            "--no-spawn",
+        ]
+        if args.checkpoint:
+            cmd += ["--checkpoint", args.checkpoint]
+        if args.selector_targets:
+            cmd += ["--selector-targets", args.selector_targets]
+        if args.selector_aux_min_confidence:
+            cmd += ["--selector-aux-min-confidence", str(args.selector_aux_min_confidence)]
+        if args.render:
+            cmd.append("--render")
+        print(f"[spawn] task={spec.task_id} vx={vx:.2f}")
+        subprocess.run(cmd, check=True)
+
+    combine_child_outputs(
+        output_dir,
+        child_dirs,
+        {
+            "eval": args.eval,
+            "num_child_runs": len(child_dirs),
+        },
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True)
@@ -251,6 +343,7 @@ def main():
     parser.add_argument("--mesh-type", default=TRAIN_MESH_TYPE, choices=["heightfield", "trimesh"])
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--render", action="store_true")
+    parser.add_argument("--no-spawn", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -263,6 +356,13 @@ def main():
 
     output_dir = Path(args.output_dir) if args.output_dir else run_dir / "info_path_probe" / time.strftime("%Y%m%d_%H%M%S")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if len(eval_items) > 1 and not args.no_spawn:
+        run_child_collections(args, eval_items, output_dir)
+        print(f"Wrote combined: {output_dir / 'info_path_samples.npz'}")
+        print(f"Wrote combined: {output_dir / 'metadata.json'}")
+        print(f"Wrote combined: {output_dir / 'collection_summary.csv'}")
+        return
 
     all_data = {}
     summaries = []

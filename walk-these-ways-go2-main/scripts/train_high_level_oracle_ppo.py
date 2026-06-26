@@ -311,7 +311,11 @@ def load_mixed_low_level_env(
         for key, value in loaded_cfg.items():
             if hasattr(Cfg, key):
                 for key2, value2 in value.items():
-                    setattr(getattr(Cfg, key), key2, value2)
+                    target = getattr(Cfg, key)
+                    if isinstance(target, dict):
+                        target[key2] = value2
+                    else:
+                        setattr(target, key2, value2)
 
     apply_condition_cfg(Cfg, "flat")
     Cfg.env.num_envs = num_envs
