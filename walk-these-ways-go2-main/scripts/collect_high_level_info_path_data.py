@@ -23,6 +23,7 @@ from train_high_level_oracle_ppo import (
     GAIT_NAMES,
     OracleConditionHighLevelEnv,
     load_selector_target_table,
+    parse_residual_action_mask,
     read_task_specs,
 )
 from train_high_level_ppo import ActorCritic, find_logdir, load_low_level_policy
@@ -82,8 +83,17 @@ def load_model(checkpoint_path, env, run_args):
         base_obs_dim=env.base_obs_dim,
         priv_dim=int(run_args.get("priv_dim", 14)),
         z_dim=int(run_args.get("z_dim", 16)),
+        selector_latent_cmd_only=bool(run_args.get("selector_latent_cmd_only", False)),
+        physical_aux_dim=int(run_args.get("physical_aux_dim", 0)),
+        selector_physical_state_input=bool(run_args.get("selector_physical_state_input", False)),
     ).to(env.device)
     model.load_state_dict(checkpoint["model"])
+    residual_mask = run_args.get("residual_action_mask")
+    if residual_mask is None:
+        residual_mask = parse_residual_action_mask(run_args.get("residual_train_dims", "all"), device=env.device)
+    else:
+        residual_mask = torch.tensor(residual_mask, device=env.device)
+    model.set_residual_action_mask(residual_mask)
     model.eval()
     return model, int(checkpoint.get("iteration", -1))
 
@@ -94,6 +104,12 @@ def augment_for_checkpoint(obs, task_index, num_tasks, use_task_id):
     one_hot = torch.zeros(obs.shape[0], num_tasks, device=obs.device, dtype=obs.dtype)
     one_hot[:, task_index] = 1.0
     return torch.cat((obs, one_hot), dim=-1)
+
+
+def append_command_vx_obs(obs, cmd_vx, enabled):
+    if not enabled:
+        return obs
+    return torch.cat((obs, cmd_vx[:, None].to(dtype=obs.dtype)), dim=-1)
 
 
 def tensor_to_numpy(tensor):
@@ -118,13 +134,14 @@ def concat_storage(storage):
 
 def gait_probs_from_z(model, obs, z):
     policy_obs = torch.cat((obs, z), dim=-1)
-    logits, _ = model.actor.distribution_params(policy_obs)
+    logits, _ = model.distribution_params(policy_obs)
     return torch.softmax(logits, dim=-1)
 
 
 def collect_item(args, spec, task_index, all_specs, logdir, low_policy, checkpoint_path, run_args):
     use_task_id = not bool(run_args.get("no_oracle_condition_obs", False))
     selector_only = bool(run_args.get("selector_only", False))
+    selector_latent_cmd_only = bool(run_args.get("selector_latent_cmd_only", False))
 
     env = OracleConditionHighLevelEnv(
         [spec],
@@ -150,6 +167,7 @@ def collect_item(args, spec, task_index, all_specs, logdir, low_policy, checkpoi
 
     obs = augment_for_checkpoint(env.reset(), task_index, len(all_specs), use_task_id)
     set_fixed_vx(env, args.current_vx)
+    obs = append_command_vx_obs(obs, env.command_vx(), selector_latent_cmd_only)
     storage = {}
     collected = 0
 
@@ -214,6 +232,7 @@ def collect_item(args, spec, task_index, all_specs, logdir, low_policy, checkpoi
                     break
 
             obs = augment_for_checkpoint(next_obs, task_index, len(all_specs), use_task_id)
+            obs = append_command_vx_obs(obs, env.command_vx(), selector_latent_cmd_only)
 
     data = concat_storage(storage)
     data["checkpoint_iteration"] = np.full(data["task_index"].shape[0], checkpoint_iteration, dtype=np.int64)

@@ -9,6 +9,1448 @@ Current source-of-truth plan:
 CURRENT_GAIT_ADAPTATION_PLAN.md
 ```
 
+Latest status, 2026-07-04:
+
+```text
+Clean no-reference direction implemented:
+
+The next line should address the failure of reward + proprioception without
+adding gait labels or terrain-specific gait rules.
+
+New training support:
+  --privileged-obs-mode clean_physics
+    zeros privileged push_active and push_axis before RMA teacher/adaptation
+    losses, so the teacher target is less like a task label.
+
+  --physical-state-coef <value>
+    adds a student-latent auxiliary loss that predicts the cleaned generic
+    physical privileged observation. This teaches the student latent to encode
+    physical state, not gait labels.
+
+Intended clean setup:
+  no direct task id
+  no selector_targets / no gait-reference supervision table
+  canonical_efficiency_v4_physical
+  selector_latent_cmd_only
+  selector_only first, continuous residuals fixed at zero
+  privileged_obs_mode = clean_physics
+  physical_state_coef > 0
+
+Purpose:
+  improve the proprioception/RMA information pathway without telling the policy
+  which gait to choose.
+
+Smoke run completed:
+  runs/high_level_oracle_gait/20260704_v4_clean_physics_notask_selectoronly_smoke_iter005
+
+Setup:
+  no direct task id
+  no selector_targets
+  selector_latent_cmd_only
+  selector_only
+  privileged_obs_mode = clean_physics
+  physical_state_coef = 0.1
+  iterations = 5
+
+Readout:
+  training runs without crashing
+  selector_target_training = false
+  style_reward_scale = 0.0, so target_gait labels are not direct rewards
+  physical_state_loss decreased from 0.1342 to 0.0835
+  adaptation_loss decreased from 0.0494 to 0.0095
+  z_error decreased from 0.0193 to 0.0084
+
+Interpretation:
+  The new clean physical-state auxiliary path is functional. The short run is
+  not a policy-quality result; gait ratios after five iterations are still just
+  early training behavior.
+
+100-iteration clean run completed:
+  runs/high_level_oracle_gait/20260704_v4_clean_physics_notask_zcmd_selectoronly_physcoef010_iter100
+
+Setup:
+  no direct task id
+  no selector_targets / no gait-reference supervision table
+  selector_latent_cmd_only
+  selector_only
+  residual_train_dims = none
+  privileged_obs_mode = clean_physics
+  physical_state_coef = 0.1
+
+Training-log readout:
+  reward: 0.6518 -> 0.7254
+  vx_err: 0.4370 -> 0.3748
+  physical_state_loss: 0.1444 -> 0.0348
+  adaptation_loss: 0.0483 -> 0.0024
+  z_error: 0.0230 -> 0.0024
+  gait_switch_rate: 0.2258 -> 0.1245
+
+Final training-time gait ratios:
+  pronking 0.179
+  trotting 0.740
+  bounding 0.063
+  pacing 0.018
+
+Interpretation:
+  The clean physical-state auxiliary improves the RMA/student physical-state
+  learning and training reward, but without the gait-reference table the policy
+  still trends strongly toward trotting. This is an important clean-result
+  signal, not a failure of the new code path.
+
+  Next required step is independent fixed-speed evaluation of checkpoint
+  high_level_000099.pt. Training-time gait ratios should not be used as final
+  evidence.
+
+Independent fixed 17-row evaluation completed:
+  runs/high_level_oracle_gait/20260704_v4_clean_physics_notask_zcmd_selectoronly_physcoef010_iter100/independent_eval/20260704_training_range_iter099
+
+Result:
+  avg reward = 0.8261
+  avg vx_err = 0.3475
+  done_rate = 0.0208
+  gait_switch_rate = 0.0000
+  top gait counts = trotting 17 / 17
+
+Comparison with reference-supervised diagnostic baseline:
+  clean physical-state run:
+    avg reward = 0.8261
+    avg vx_err = 0.3475
+    top gait counts = trotting 17 / 17
+
+  reference-supervised diagnostic baseline:
+    avg reward = 0.8195
+    avg vx_err = 0.3533
+    top gait counts = pronking 6 / 17, trotting 11 / 17
+
+Interpretation:
+  The clean no-reference run is not worse as a locomotion policy under the
+  current unified reward. It is slightly better on average reward and speed
+  error, but it collapses to stable all-trotting. This strongly suggests that
+  under canonical_efficiency_v4_physical and default continuous parameters,
+  visible gait-family differentiation is not naturally rewarded.
+
+  This is a clean-result finding: better physical-state encoding alone improves
+  training health but does not create multi-gait switching without gait-reference
+  supervision.
+
+Information-path probe completed:
+  runs/high_level_oracle_gait/info_path_probe/20260704_clean_physics_no_reference_iter099/analysis
+
+Probe results:
+  history -> task test_acc = 0.597
+  history -> speed test_acc = 0.847
+  z_student -> task test_acc = 0.565
+  z_student -> speed test_acc = 0.391
+  z_teacher -> task test_acc = 0.934
+  z_teacher -> speed test_acc = 0.332
+
+Latent sensitivity:
+  student vs teacher mean gait-prob diff = 0.0023
+  student vs zero latent mean gait-prob diff = 0.0065
+  student vs shuffled latent mean gait-prob diff = 0.0017
+
+Interpretation:
+  The raw proprioceptive history contains usable condition and speed
+  information, but the learned gait selector barely uses the student latent.
+  The all-trot behavior is therefore a combination of weak latent use and a
+  unified reward landscape that does not strongly reward discrete gait
+  switching.
+
+  Next clean direction should test architectural coupling, not add gait labels:
+  make the gait selector depend more directly on physical-state predictions or
+  history summaries, while still not supervising the gait choice itself.
+
+Implemented next clean coupling hook, 2026-07-05:
+  --selector-physical-state-input
+
+When this flag is combined with:
+  --selector-latent-cmd-only
+  --physical-state-coef > 0
+  --privileged-obs-mode clean_physics
+
+the gait selector input becomes:
+  command vx + student RMA latent + predicted clean physical state
+
+The predicted physical state is detached in the selector path. This keeps the
+physical prediction head trained by the physical-state loss, rather than letting
+the policy/gait reward distort it into a hidden gait label. The run still uses
+no direct task id and no gait-reference supervision table.
+
+100-iteration zcmd+physical-state selector run completed:
+  runs/high_level_oracle_gait/20260705_v4_clean_physics_notask_zcmdphys_selectoronly_physcoef010_iter100
+
+Setup:
+  no direct task id
+  no selector_targets / no gait-reference supervision table
+  selector_latent_cmd_only
+  selector_physical_state_input
+  selector_only
+  residual_train_dims = none
+  privileged_obs_mode = clean_physics
+  physical_state_coef = 0.1
+
+Training-log readout:
+  reward: 0.6507 -> 0.7249
+  vx_err: 0.4597 -> 0.3459
+  adaptation_loss: 0.0453 -> 0.0022
+  physical_state_loss: 0.1339 -> 0.0422
+  z_error: 0.0190 -> 0.0019
+  gait_switch_rate: 0.2263 -> 0.1326
+  final training-time gait ratios:
+    pronking 0.1997
+    trotting 0.7168
+    bounding 0.0000
+    pacing 0.0835
+
+Initial interpretation:
+  The predicted-physical-state selector input is functional and the physical
+  prediction loss keeps improving. Training reward and speed tracking also
+  improve. However, training-time gait ratios still trend strongly toward
+  trotting, so this run has not yet shown clean gait-family differentiation.
+
+  Do not conclude from training-time ratios alone. The required next check is
+  the same fixed 17-row independent evaluation used for the previous clean
+  no-reference run.
+
+Independent fixed 17-row evaluation completed:
+  runs/high_level_oracle_gait/20260705_v4_clean_physics_notask_zcmdphys_selectoronly_physcoef010_iter100/independent_eval/20260705_training_range_iter099
+
+Result:
+  avg reward = 0.8260
+  avg vx_err = 0.3483
+  done_rate = 0.0208
+  gait_switch_rate = 0.0000
+  top gait counts = trotting 17 / 17
+
+Comparison with previous clean no-reference zcmd-only run:
+  avg reward delta = -0.0002
+  avg vx_err delta = +0.0008
+  top-gait decisions unchanged: trotting 17 / 17 in both runs
+
+Interpretation:
+  Feeding the gait selector with predicted clean physical state does not change
+  the fixed-condition behavior under the current unified reward. It is almost
+  numerically identical to the previous clean all-trot run.
+
+  This is evidence that the current bottleneck is not simply "the selector needs
+  an explicit physical-state vector." Under canonical_efficiency_v4_physical,
+  default continuous parameters, no task id, and no gait-reference supervision,
+  the stable solution remains all-trotting.
+
+Information-path probe completed for zcmd+physical-state run:
+  runs/high_level_oracle_gait/info_path_probe/20260705_clean_physics_zcmdphys_iter099/analysis
+
+Probe results:
+  history -> task test_acc = 0.586
+  history -> speed test_acc = 0.855
+  z_student -> task test_acc = 0.553
+  z_student -> speed test_acc = 0.390
+  z_teacher -> task test_acc = 0.942
+  z_teacher -> speed test_acc = 0.331
+
+Latent sensitivity:
+  student vs teacher mean gait-prob diff = 0.0113
+  student vs zero latent mean gait-prob diff = 0.0173
+  student vs shuffled latent mean gait-prob diff = 0.0076
+
+Interpretation:
+  The raw proprioceptive history still contains useful speed and moderate task
+  information. The student latent remains weak for speed and only moderate for
+  task. Feeding predicted physical state into the selector slightly increases
+  sensitivity versus the previous clean no-reference run, but the sensitivity is
+  still far too small to produce visible gait switching.
+
+  All task-speed gait probabilities are trotting-top, with trotting probability
+  usually above 0.79 and often above 0.90. This reinforces the fixed-evaluation
+  conclusion: the current clean no-reference setup learns a strong all-trotting
+  solution, not condition-driven gait-family switching.
+
+Curriculum diagnostic support implemented, 2026-07-06:
+  --include-task-ids
+  --task-sampling-weights
+
+Purpose:
+  test whether a minority gait advantage, such as ramp/pronking, can be learned
+  when the training distribution starts narrow and is gradually expanded,
+  without adding task ids, gait-reference tables, or per-terrain reward changes.
+
+This only changes which tasks are sampled and how many parallel environments
+each selected task receives. It does not tell the policy which gait to choose.
+
+Next clean diagnostic:
+  Stage 1 should train ramp-only with canonical_efficiency_v4_physical,
+  selector_physical_state_input, selector_only, residual_train_dims=none, no
+  direct task id, and no selector_targets. If ramp-only remains all-trotting,
+  the current v4/default-template setup does not provide a strong enough ramp
+  pronking incentive even without other terrains.
+```
+
+```text
+Important interpretation correction:
+
+The current good pronking/trotting differentiation should not be described as a
+pure emergent result of the unified physical reward.
+
+The current reference-supervised diagnostic baseline:
+  runs/high_level_oracle_gait/20260626_v4_physical_notask_zcmd_selector_refprob_highconf_coef035_iter100/checkpoints/high_level_000099.pt
+
+does not receive a direct task id at inference time, but it was trained with a
+fair-audit-derived gait-reference target on the gait selector.
+
+Therefore this run is a diagnostic / upper-bound result:
+  it shows that the RMA latent + command-speed pathway can support condition-
+  dependent gait selection when the selector is given an explicit reference
+  signal during training.
+
+It is not the final clean generalization claim.
+
+The clean mainline remains:
+  no direct task id
+  no gait-reference supervision table
+  unified physical reward
+  proprioceptive history / RMA only
+
+The current reference-supervised baseline is still useful for debugging,
+visualization, and measuring what the architecture can express, but it should
+not be presented as evidence that the robot independently discovered the gait
+rules from reward alone.
+```
+
+```text
+Single-scene visual checks completed for the current reference-supervised
+diagnostic baseline:
+
+Policy:
+  runs/high_level_oracle_gait/20260626_v4_physical_notask_zcmd_selector_refprob_highconf_coef035_iter100/checkpoints/high_level_000099.pt
+
+Visual observations:
+  ramp_up_trot_robustness vx=1.0:
+    mostly pronking, as expected. Main visible issue is yaw/heading drift or
+    horizontal drift when the body direction becomes slightly biased.
+
+  rough_slope_trot_robustness vx=1.0:
+    pronking and trotting alternate. This is acceptable because rough 1.0 is a
+    boundary case in the numerical evaluation rather than a high-confidence
+    single-gait case.
+
+  flat_trot_efficiency vx=1.0:
+    almost entirely trotting. One occasional initial pronking episode appears
+    related to the reset/landing state and does not persist.
+
+  push_lateral_pace_recovery vx=1.5:
+    mostly trotting. After lateral pushes, the policy can briefly switch to
+    pronking for about one second and then return to trotting. This looks like a
+    plausible recovery behavior rather than a failure.
+
+  stepping_stones_easy_bound_highspeed vx=2.0:
+    almost entirely trotting. Deep gaps cause tripping, speed loss, and falls as
+    expected for this terrain. The current diagnostic baseline does not express
+    bounding or pacing as a gap-crossing strategy.
+
+Interpretation:
+  The visual checks support the numerical conclusion that the policy has a real
+  pronking/trotting condition response. The biggest limitation is not flat,
+  ramp, rough, or push gait selection, but the stepping-stones/deep-gap setting:
+  the current diagnostic baseline uses trot and does not solve deep gap
+  crossing.
+
+  This should be reported as a capability limit, not silently treated as a
+  reward bug. Improving stones would likely require a separate capability
+  target, terrain setup, or low-level/template support for gap-crossing gaits.
+```
+
+```text
+Visualization playback support updated:
+
+scripts/play_oracle_policy_training_map.py now loads current high-level
+checkpoints using args.json, including:
+  no direct task id
+  student RMA latent
+  selector_latent_cmd_only
+  residual action masks
+  selector-only inference mode
+
+This matters because the current diagnostic baseline is not an old task-id
+policy. Using the previous playback loader would have visualized the wrong
+observation contract or failed to load the checkpoint.
+
+Follow-up fix:
+  when --sample-vx is not set, the playback script now reapplies deterministic
+  command speeds after each environment step/reset. Without this, reset events
+  could resample cmd_vx, so a "fixed-speed" visualization would drift into a
+  sampled-speed visualization.
+```
+
+```text
+Reference-supervised diagnostic baseline fixed 17-row repeat evaluation
+completed and passed.
+
+Combined repeat output:
+
+runs/high_level_oracle_gait/20260626_v4_physical_notask_zcmd_selector_refprob_highconf_coef035_iter100/independent_eval/20260703_training_range_repeat_combined17_iter099
+
+It combines:
+  20260703_training_range_repeat_iter099
+  20260703_training_range_repeat_missing3_iter099
+
+Original fixed 17-row evaluation:
+  avg reward = 0.8195
+  avg vx_err = 0.3533
+  done_rate = 0.0209
+  gait_switch_rate = 0.0212
+  reference top-gait match = 11 / 17
+  high-confidence match = 7 / 7
+  confidence-weighted match = 0.879
+  top-gait counts = pronking 6, trotting 11
+
+Repeat fixed 17-row evaluation:
+  avg reward = 0.8189
+  avg vx_err = 0.3546
+  done_rate = 0.0209
+  gait_switch_rate = 0.0215
+  reference top-gait match = 11 / 17
+  high-confidence match = 7 / 7
+  confidence-weighted match = 0.879
+  top-gait counts = pronking 6, trotting 11
+
+Interpretation:
+  The reference-supervised diagnostic baseline is repeat-stable on the fixed
+  17-row evaluation. Every top-gait decision matches the original evaluation.
+  Aggregate reward and speed error are nearly unchanged.
+
+  The only visible drift is slightly worse push 1.2 / 1.5 speed error, but this
+  does not change the gait decision or the overall interpretation.
+
+Implementation fix:
+  evaluate_high_level_policy_by_task.py --full now covers the current 17-row
+  training-range set, including push 1.2 / push 1.8 / stones 1.7. Previously it
+  covered only 14 rows.
+```
+
+Previous status, 2026-07-02:
+
+```text
+Interpolation-speed evaluation completed for the current main baseline:
+
+runs/high_level_oracle_gait/20260626_v4_physical_notask_zcmd_selector_refprob_highconf_coef035_iter100/independent_eval/20260702_interpolation_iter099
+
+Setup:
+  direct task id: no
+  gait selector input: student RMA latent + command vx
+  continuous residuals: fixed at zero/default WTW parameters
+  evaluated intermediate speeds between the fixed training/evaluation speeds
+
+Aggregate:
+  rows = 12
+  avg reward = 0.8240
+  avg vx_err = 0.3206
+  avg done_rate = 0.0211
+  avg gait_switch_rate = 0.0260
+
+Per-condition behavior:
+  flat:
+    vx 0.75 is a mixed transition point, trotting 0.533 / pronking 0.467
+    vx 1.25 and 1.75 are stable trotting
+
+  ramp:
+    vx 0.75 / 1.25 / 1.75 are all pronking-dominant
+    pronking probability decreases smoothly as speed increases
+
+  rough:
+    vx 0.75 is pronking-dominant
+    vx 1.25 is near the pronking/trotting boundary
+    vx 1.75 becomes trotting-dominant
+
+  push:
+    vx 1.35 and 1.65 are stable trotting
+
+  stepping stones:
+    vx 1.85 is stable trotting
+
+Interpretation:
+  The current baseline is not merely memorizing the 17 fixed evaluation speeds.
+  It gives smooth intermediate-speed behavior and keeps the same pronking vs
+  trotting structure seen at neighboring fixed speeds.
+
+Same-speed condition check using existing fixed + interpolation evaluations:
+  vx 1.00:
+    flat pronking/trotting = 0.017 / 0.983
+    ramp pronking/trotting = 0.975 / 0.025
+    rough pronking/trotting = 0.680 / 0.320
+
+  vx 1.50:
+    flat pronking/trotting = 0.000 / 1.000
+    ramp pronking/trotting = 0.731 / 0.269
+    rough pronking/trotting = 0.417 / 0.583
+
+  vx 1.75:
+    flat pronking/trotting = 0.000 / 1.000
+    ramp pronking/trotting = 0.543 / 0.457
+    rough pronking/trotting = 0.354 / 0.646
+
+Updated interpretation:
+  The policy is not a pure speed-threshold policy. At the same command speed,
+  ramp remains much more pronking-biased than flat, and rough sits between flat
+  and ramp. This is evidence that the gait selector uses condition information,
+  not only command speed.
+
+  The limitation remains that only pronking and trotting appear as dominant top
+  gaits. Bounding and pacing are still not expressed under the current baseline.
+```
+
+Previous status, 2026-07-02:
+
+```text
+Current main baseline is now the selector-only/default-continuous-parameter
+policy:
+
+runs/high_level_oracle_gait/20260626_v4_physical_notask_zcmd_selector_refprob_highconf_coef035_iter100
+
+Fixed 17-row evaluation:
+
+runs/high_level_oracle_gait/20260626_v4_physical_notask_zcmd_selector_refprob_highconf_coef035_iter100/independent_eval/20260627_training_range_iter099
+
+Baseline comparison files:
+
+runs/high_level_oracle_gait/20260626_v4_physical_notask_zcmd_selector_refprob_highconf_coef035_iter100/independent_eval/20260627_training_range_iter099/main_baseline_reference_comparison.csv
+runs/high_level_oracle_gait/20260626_v4_physical_notask_zcmd_selector_refprob_highconf_coef035_iter100/independent_eval/20260627_training_range_iter099/main_baseline_reference_comparison.md
+
+Summary:
+  direct task id: no
+  gait selector input: student RMA latent + command vx
+  continuous residuals: fixed at zero/default WTW parameters
+  reference top-gait match: 11 / 17
+  high-confidence rows: 7 / 7
+  confidence-weighted match: 0.879
+  avg reward: 0.8195
+  avg vx_err: 0.3533
+  avg done_rate: 0.0209
+  avg gait_switch_rate: 0.0212
+  learned top-gait counts: pronking 6, trotting 11
+
+Decision:
+  Use this as the active baseline. Frequency-only and footswing-height-only
+  continuous-parameter diagnostics did not beat it. Do not open continuous
+  residuals again without a specific physical hypothesis and a clear pass
+  criterion.
+
+Next work:
+  Evaluate whether this baseline is genuinely condition-aware, not merely a
+  speed-threshold policy. The next useful tests are interpolation-speed and
+  same-speed cross-condition evaluations, followed by information-path checks
+  only if the behavior suggests weak terrain conditioning.
+```
+
+Previous status, 2026-06-30:
+
+```text
+Footswing-height-only residual diagnostic completed:
+
+runs/high_level_oracle_gait/20260630_v4_physical_notask_zcmd_fullaction_from_selector_coef035_freeze_selector_rma_zerohead_footswing_only_std015_resl2coef001_iter030/independent_eval/20260630_training_range_iter029
+
+Setup:
+  initialized from selector-only coef 0.35 checkpoint
+  gait selector reads [student RMA latent, command vx]
+  gait selector and RMA frozen
+  only footswing_height residual enabled
+  frequency / duration / stance_width / body_pitch held at zero
+  residual head zero-initialized
+  residual_std = 0.15
+  residual_l2_coef = 0.01
+
+Full 17-row fixed evaluation:
+  reference match = 11 / 17
+  high-confidence rows = 7 / 7
+  avg reward = 0.8191
+  avg vx_err = 0.3513
+  avg requested residual abs = 0.0182
+  avg executed residual abs = 0.0089
+  avg footswing_height = 0.0804
+  avg clearance score = 0.5050
+  residual boundary rate = 0.0000
+
+Comparison:
+  selector-only coef 0.35:
+    avg reward = 0.8195
+    avg vx_err = 0.3533
+    avg footswing_height = 0.0800
+    avg clearance score = 0.5000
+
+  frequency-only residual:
+    avg reward = 0.8187
+    avg vx_err = 0.3531
+    avg executed residual abs = 0.0084
+
+Interpretation:
+  Footswing-height-only tuning preserves the healthy gait selector and slightly
+  improves average speed error and clearance, but it still does not beat the
+  selector-only/default-parameter baseline on average reward.
+
+  The aggregate gain is not clean: rough and stones improve modestly, while
+  push 1.5 becomes clearly worse. This is not strong enough to justify opening
+  footswing_height as a default continuous parameter.
+
+Current conclusion:
+  Frequency-only and footswing-height-only diagnostics both preserve gait
+  selection but fail to produce a robust gain over default WTW continuous
+  parameters. The active baseline remains staged training with continuous
+  residuals fixed at zero unless a later parameterization shows clear value.
+
+Next decision:
+  Do not blindly open more residual dimensions. Either stop continuous-parameter
+  tuning for now and treat the selector-only policy as the main baseline, or
+  run one more narrowly justified diagnostic only if there is a specific
+  physical reason.
+```
+
+Previous status, 2026-06-30:
+
+```text
+Frequency-only residual diagnostic completed:
+
+runs/high_level_oracle_gait/20260630_v4_physical_notask_zcmd_fullaction_from_selector_coef035_freeze_selector_rma_zerohead_frequency_only_std015_resl2coef001_iter030/independent_eval/20260630_training_range_iter029
+
+Setup:
+  initialized from selector-only coef 0.35 checkpoint
+  gait selector reads [student RMA latent, command vx]
+  gait selector and RMA frozen
+  only frequency residual enabled
+  duration / footswing_height / stance_width / body_pitch held at zero
+  residual head zero-initialized
+  residual_std = 0.15
+  residual_l2_coef = 0.01
+
+Full 17-row fixed evaluation:
+  reference match = 11 / 17
+  high-confidence rows = 7 / 7
+  avg reward = 0.8187
+  avg vx_err = 0.3531
+  avg requested residual abs = 0.0154
+  avg executed residual abs = 0.0084
+  avg frequency = 2.9924
+  residual boundary rate = 0.0000
+
+Comparison:
+  selector-only coef 0.35:
+    avg reward = 0.8195
+    avg vx_err = 0.3533
+
+  protected residual, std=0.10, l2=0.03:
+    avg reward = 0.8193
+    avg vx_err = 0.3532
+    avg executed residual abs = 0.0257
+
+Interpretation:
+  Frequency-only tuning preserves the healthy gait selector but does not beat
+  selector-only/default continuous parameters. The tiny speed-error improvement
+  is not enough because avg reward is lower than selector-only and lower than
+  the conservative protected residual run.
+
+  Cadence/frequency alone is not a useful residual adaptation under the current
+  setup. The next one-parameter diagnostic should test footswing_height only.
+
+Implementation:
+  --residual-train-dims is now available in train_high_level_oracle_ppo.py.
+  Evaluation and information-path collection read the residual mask from
+  args.json, so one-parameter residual diagnostics evaluate the same residual
+  dimensions that were trained.
+
+Training interpretation:
+  early random continuous-parameter exploration makes reward attribution noisy.
+  The active strategy is staged training: first stabilize gait selection with
+  zero continuous residuals, then open one continuous parameter at a time for
+  small local tuning.
+```
+
+2026-06-26 z+speed gait-selector diagnostic fixed evaluation:
+
+```text
+runs/high_level_oracle_gait/20260626_v4_physical_notask_zcmd_selector_refprob_highconf_coef020_iter100/independent_eval/20260626_training_range_iter099
+```
+
+Setup:
+
+```text
+no direct task id
+selector_only = true
+selector_latent_cmd_only = true
+continuous residuals fixed to zero
+gait selector input = [student RMA latent, command vx]
+selector_aux_min_confidence = 0.25
+selector_aux_coef = 0.20
+```
+
+Result against the v4 fair-audit-derived gait reference table:
+
+```text
+reference top gait vs learned top gait = 10 / 17
+confidence-weighted match = 0.738
+high-confidence rows = 6 / 7
+
+learned top gait count:
+  pronking = 5 / 17
+  trotting = 12 / 17
+  bounding = 0 / 17
+  pacing = 0 / 17
+```
+
+High-confidence rows:
+
+```text
+flat 1.5:  ref trotting,  learned trotting
+flat 2.0:  ref trotting,  learned trotting
+ramp 1.0:  ref pronking,  learned pronking
+ramp 1.5:  ref pronking,  learned trotting   <-- remaining high-confidence failure
+push 1.2:  ref trotting,  learned trotting
+push 1.5:  ref trotting,  learned trotting
+push 1.8:  ref trotting,  learned trotting
+```
+
+Interpretation:
+
+```text
+This is a partial success, not a full solution.
+
+Compared with the previous no-task/RMA full-action run, forcing the gait selector
+to use only [student latent, command vx] improved the high-confidence match from
+5/7 to 6/7 and improved confidence-weighted match from 0.637 to 0.738.
+It recovered ramp 1.0 pronking, which the previous no-task/RMA run missed.
+
+However, ramp 1.5 still fails: the reference table strongly prefers pronking
+there, but the learned selector chooses trotting. The learned policy also uses
+only pronking/trotting; this is acceptable for the high-confidence rows because
+none of those rows require bounding or pacing, but it means low-confidence
+stones/pacing results should not be over-interpreted.
+
+The current behavior looks like a speed-threshold rule more than a fully
+condition-aware latent rule: lower-speed rows tend toward pronking, higher-speed
+rows tend toward trotting. The next question is whether the gait selector has
+become more sensitive to the RMA latent, or whether it is mostly using command
+speed and still underusing latent terrain/condition information.
+```
+
+Next step:
+
+```text
+Run the information-path probe again on this z+speed selector checkpoint.
+The key metric is latent sensitivity: replacing student latent with teacher,
+zero, or shuffled latent should change gait probabilities much more than the
+previous 0.005-0.009 range. If sensitivity remains tiny, the selector is still
+mostly ignoring the latent. If sensitivity increases but ramp 1.5 remains wrong,
+then the student latent or reference training strength needs targeted work.
+```
+
+2026-06-26 z+speed gait-selector information-path result:
+
+```text
+runs/high_level_oracle_gait/info_path_probe/20260626_notask_zcmd_selector_highconf_coef020/analysis
+```
+
+Simple diagnostic accuracy:
+
+```text
+history -> task                    test_acc = 0.565
+history -> speed                   test_acc = 0.858
+history -> reference top gait       test_acc = 0.884
+
+student RMA latent -> task          test_acc = 0.458
+student RMA latent -> speed         test_acc = 0.561
+student RMA latent -> ref top gait  test_acc = 0.921
+
+teacher latent -> task              test_acc = 0.936
+teacher latent -> speed             test_acc = 0.312
+teacher latent -> ref top gait      test_acc = 1.000
+```
+
+Latent-swap sensitivity:
+
+```text
+student latent vs teacher latent: mean gait-prob diff = 0.0492
+student latent vs zero latent:    mean gait-prob diff = 0.0993
+student latent vs shuffled latent: mean gait-prob diff = 0.0350
+```
+
+Interpretation:
+
+```text
+The z+speed selector branch does make the gait selector use the RMA latent more
+than the previous no-task/RMA full-action policy. The previous latent-swap
+differences were only about 0.005-0.009; this run increases them to 0.035-0.099.
+
+Therefore the earlier bottleneck, "the gait selector almost ignores latent",
+has been partially fixed by forcing the selector to read [student latent,
+command vx].
+
+The remaining failure is more specific:
+  ramp 1.0: reference pronking, learned pronking
+  ramp 1.5: reference pronking, learned trotting
+
+On ramp 1.5 the learned probabilities are close:
+  pronking = 0.361
+  trotting = 0.417
+
+So the issue is no longer complete latent non-use. It is now a weak/marginal
+decision around ramp 1.5, likely from a combination of speed shortcut bias and
+not enough reference pull for high-confidence pronking rows. The learned rule
+still resembles low-speed pronking vs high-speed trotting more than a fully
+terrain-aware gait decision.
+```
+
+Next decision:
+
+```text
+Do not return to reward editing.
+Do not add direct task id as the main solution.
+
+The next minimal run should keep the z+speed selector-only structure, but make
+the high-confidence gait-reference training stronger or longer, then re-check
+ramp 1.5 and latent sensitivity. If ramp 1.5 still fails after that, improve the
+student RMA latent itself rather than further tuning v4 reward.
+```
+
+2026-06-27 stronger z+speed gait-selector fixed evaluation:
+
+```text
+runs/high_level_oracle_gait/20260626_v4_physical_notask_zcmd_selector_refprob_highconf_coef035_iter100/independent_eval/20260627_training_range_iter099
+```
+
+Setup:
+
+```text
+no direct task id
+selector_only = true
+selector_latent_cmd_only = true
+continuous residuals fixed to zero
+gait selector input = [student RMA latent, command vx]
+selector_aux_min_confidence = 0.25
+selector_aux_coef = 0.35
+```
+
+Result against the v4 fair-audit-derived gait reference table:
+
+```text
+reference top gait vs learned top gait = 11 / 17
+confidence-weighted match = 0.879
+high-confidence rows = 7 / 7
+
+learned top gait count:
+  pronking = 6 / 17
+  trotting = 11 / 17
+  bounding = 0 / 17
+  pacing = 0 / 17
+```
+
+High-confidence rows:
+
+```text
+flat 1.5:  ref trotting,  learned trotting
+flat 2.0:  ref trotting,  learned trotting
+ramp 1.0:  ref pronking,  learned pronking
+ramp 1.5:  ref pronking,  learned pronking
+push 1.2:  ref trotting,  learned trotting
+push 1.5:  ref trotting,  learned trotting
+push 1.8:  ref trotting,  learned trotting
+```
+
+Key comparison:
+
+```text
+selector_aux_coef = 0.20:
+  confidence-weighted match = 0.738
+  high-confidence rows = 6 / 7
+  ramp 1.5 = learned trotting, ref pronking
+
+selector_aux_coef = 0.35:
+  confidence-weighted match = 0.879
+  high-confidence rows = 7 / 7
+  ramp 1.5 = learned pronking, ref pronking
+```
+
+Interpretation:
+
+```text
+Increasing the high-confidence gait-reference training strength fixes the
+remaining ramp 1.5 failure in the z+speed selector-only diagnostic. This
+supports the interpretation that the student RMA latent plus command speed
+contains enough information for the high-confidence reference rows, but the
+0.20 coefficient was not strong enough to overcome the high-speed trotting
+tendency.
+
+This remains a diagnostic rather than a final deployable policy:
+  - continuous residuals are fixed to zero;
+  - no direct task id is used, which is good;
+  - the learned top gaits are only pronking/trotting;
+  - low-confidence stones/pacing rows should not be treated as decisive failures.
+
+Next, run the information-path probe on the 0.35 checkpoint to confirm that the
+improvement is still supported by meaningful RMA-latent sensitivity rather than
+only by a stronger speed shortcut.
+```
+
+2026-06-27 stronger z+speed gait-selector information-path result:
+
+```text
+runs/high_level_oracle_gait/info_path_probe/20260627_notask_zcmd_selector_highconf_coef035/analysis
+```
+
+Simple diagnostic accuracy:
+
+```text
+history -> task                    test_acc = 0.644
+history -> speed                   test_acc = 0.856
+history -> reference top gait       test_acc = 0.941
+
+student RMA latent -> task          test_acc = 0.576
+student RMA latent -> speed         test_acc = 0.608
+student RMA latent -> ref top gait  test_acc = 0.950
+
+teacher latent -> task              test_acc = 0.928
+teacher latent -> speed             test_acc = 0.338
+teacher latent -> ref top gait      test_acc = 1.000
+```
+
+Latent-replacement sensitivity:
+
+```text
+student latent vs teacher latent:  mean gait-prob diff = 0.0521
+student latent vs zero latent:     mean gait-prob diff = 0.0770
+student latent vs shuffled latent: mean gait-prob diff = 0.0401
+```
+
+Key task-speed probabilities:
+
+```text
+ramp 1.0:
+  reference = pronking
+  learned top = pronking
+  pronking prob = 0.556
+  trotting prob = 0.293
+
+ramp 1.5:
+  reference = pronking
+  learned top = pronking
+  pronking prob = 0.465
+  trotting prob = 0.336
+```
+
+Interpretation:
+
+```text
+The coef 0.35 result confirms that the improvement is not merely a blind speed
+shortcut. The student RMA latent is more predictive than in the coef 0.20 run:
+  - student latent -> task improved from 0.458 to 0.576;
+  - student latent -> speed improved from 0.561 to 0.608;
+  - student latent -> reference top gait improved from 0.921 to 0.950.
+
+The gait selector also remains meaningfully sensitive to latent replacement:
+0.040-0.077 for shuffled/zero latent and 0.052 for teacher latent, far above
+the earlier no-task/RMA full-action baseline of 0.005-0.009.
+
+Therefore, in the controlled selector-only setting, the current information path
+works:
+  proprioceptive history -> student RMA latent + command speed -> gait selector
+
+The next stage should test whether this information path survives when
+continuous residual actions are enabled. That requires allowing
+selector_latent_cmd_only without forcing selector_only, so the gait selector can
+still use [student latent, command vx] while the continuous-parameter branch is
+trained normally.
+```
+
+Implementation update:
+
+```text
+scripts/train_high_level_oracle_ppo.py now allows --selector-latent-cmd-only
+without --selector-only.
+
+Meaning:
+  gait selector branch = [student RMA latent, command vx]
+  continuous residual branch = normal high-level policy observation path
+
+This enables the next diagnostic: full high-level action training without direct
+task id, while preserving the controlled information path for gait selection.
+```
+
+Syntax check passed:
+
+```text
+python3 -m py_compile scripts/train_high_level_oracle_ppo.py \
+  scripts/train_high_level_ppo.py \
+  scripts/evaluate_high_level_policy_by_task.py \
+  scripts/collect_high_level_info_path_data.py
+```
+
+2026-06-28 z+speed full-action diagnostic fixed evaluation:
+
+```text
+runs/high_level_oracle_gait/20260627_v4_physical_notask_zcmd_fullaction_refprob_highconf_coef035_iter100/independent_eval/20260628_training_range_iter099
+```
+
+Setup:
+
+```text
+no direct task id
+selector_only = false
+selector_latent_cmd_only = true
+continuous residuals enabled
+gait selector input = [student RMA latent, command vx]
+selector_aux_min_confidence = 0.25
+selector_aux_coef = 0.35
+```
+
+Result against the v4 fair-audit-derived gait reference table:
+
+```text
+reference top gait vs learned top gait = 9 / 17
+confidence-weighted match = 0.723
+high-confidence rows = 6 / 7
+
+learned top gait count:
+  pronking = 6 / 17
+  trotting = 11 / 17
+  bounding = 0 / 17
+  pacing = 0 / 17
+```
+
+High-confidence rows:
+
+```text
+flat 1.5:  ref trotting,  learned trotting
+flat 2.0:  ref trotting,  learned trotting
+ramp 1.0:  ref pronking,  learned pronking
+ramp 1.5:  ref pronking,  learned trotting   <-- failed again after residuals enabled
+push 1.2:  ref trotting,  learned trotting
+push 1.5:  ref trotting,  learned trotting
+push 1.8:  ref trotting,  learned trotting
+```
+
+Important comparison:
+
+```text
+selector-only, coef 0.35:
+  confidence-weighted match = 0.879
+  high-confidence rows = 7 / 7
+  ramp 1.5 = learned pronking, ref pronking
+
+full-action, coef 0.35:
+  confidence-weighted match = 0.723
+  high-confidence rows = 6 / 7
+  ramp 1.5 = learned trotting, ref pronking
+```
+
+Interpretation:
+
+```text
+Opening continuous residual actions reintroduces the gait-selection failure.
+The controlled information path works when residuals are fixed, but full-action
+training again weakens the high-confidence gait structure.
+
+The current bottleneck is no longer reward design and no longer total latent
+non-use. It is the interaction between continuous-parameter learning and gait
+selection: once residuals are trainable, the policy can improve or stabilize the
+performance objective while letting the selector drift back toward a trotting
+solution at ramp 1.5.
+
+The next stage should be staged training, not another reward edit:
+  1. start from the selector-only coef 0.35 checkpoint that gets high-confidence
+     rows correct;
+  2. freeze or strongly protect the gait selector branch;
+  3. train only the continuous residual branch for a short diagnostic;
+  4. then unfreeze carefully if the fixed 17-point evaluation still preserves
+     ramp 1.5 pronking.
+```
+
+Implementation update for staged training:
+
+```text
+scripts/train_high_level_oracle_ppo.py now supports:
+
+--init-checkpoint
+  initialize the high-level model from an existing high_level_*.pt checkpoint
+
+--freeze-latent-cmd-selector
+  freeze the gait selector branch that reads [student RMA latent, command vx]
+
+--freeze-rma
+  freeze both the student adaptation module and the privileged teacher encoder
+```
+
+Intended next diagnostic:
+
+```text
+Initialize from:
+  runs/high_level_oracle_gait/20260626_v4_physical_notask_zcmd_selector_refprob_highconf_coef035_iter100/checkpoints/high_level_000099.pt
+
+Freeze:
+  latent_cmd_selector
+  adaptation_module
+  terrain_encoder
+
+Train:
+  continuous residual branch and value/remaining policy parameters
+
+Purpose:
+  test whether continuous residuals can be learned without destroying the
+  already-correct high-confidence gait-selection structure.
+```
+
+2026-06-28 staged full-action diagnostic result:
+
+```text
+runs/high_level_oracle_gait/20260628_v4_physical_notask_zcmd_fullaction_from_selector_coef035_freeze_selector_rma_iter100/independent_eval/20260628_training_range_iter099
+```
+
+Setup:
+
+```text
+initialized from selector-only coef 0.35 checkpoint
+no direct task id
+selector_latent_cmd_only = true
+selector_only = false
+continuous residuals enabled
+frozen latent_cmd_selector = true
+frozen RMA = true
+selector_aux_min_confidence = 0.25
+selector_aux_coef = 0.35
+```
+
+Result against the v4 fair-audit-derived gait reference table:
+
+```text
+reference top gait vs learned top gait = 11 / 17
+confidence-weighted match = 0.879
+high-confidence rows = 7 / 7
+
+learned top gait count:
+  pronking = 6 / 17
+  trotting = 11 / 17
+  bounding = 0 / 17
+  pacing = 0 / 17
+```
+
+High-confidence rows:
+
+```text
+flat 1.5:  ref trotting,  learned trotting
+flat 2.0:  ref trotting,  learned trotting
+ramp 1.0:  ref pronking,  learned pronking
+ramp 1.5:  ref pronking,  learned pronking
+push 1.2:  ref trotting,  learned trotting
+push 1.5:  ref trotting,  learned trotting
+push 1.8:  ref trotting,  learned trotting
+```
+
+Comparison:
+
+```text
+selector-only coef 0.35:
+  confidence-weighted match = 0.879
+  high-confidence rows = 7 / 7
+  avg reward = 0.8195
+  avg vx_err = 0.3533
+
+naive full-action coef 0.35:
+  confidence-weighted match = 0.723
+  high-confidence rows = 6 / 7
+  avg reward = 0.7673
+  avg vx_err = 0.3499
+  ramp 1.5 failed back to trotting
+
+staged full-action from selector-only, frozen selector/RMA:
+  confidence-weighted match = 0.879
+  high-confidence rows = 7 / 7
+  avg reward = 0.7681
+  avg vx_err = 0.3659
+  ramp 1.5 preserved pronking
+```
+
+Interpretation:
+
+```text
+The staged training idea works for preserving gait structure: freezing the
+already-correct gait selector and RMA prevents the continuous residual branch
+from pulling ramp 1.5 back to trotting.
+
+However, this staged full-action run does not yet improve performance over the
+selector-only checkpoint. Average reward is lower than selector-only, and
+average speed error is slightly worse. The continuous residual branch changed
+parameters, especially lowering frequency and increasing foot swing height, but
+that did not translate into a clear performance gain.
+
+Current conclusion:
+  - information path: works in controlled setting;
+  - staged freezing: preserves high-confidence gait choices;
+  - continuous residual learning: not yet useful enough.
+
+Next work should focus on making the continuous residual branch learn useful
+parameter adaptations without damaging the gait selector. Do not return to
+reward tuning for this issue.
+```
+
+2026-06-28 shorter staged full-action diagnostic result:
+
+```text
+runs/high_level_oracle_gait/20260628_v4_physical_notask_zcmd_fullaction_from_selector_coef035_freeze_selector_rma_iter030/independent_eval/20260628_training_range_iter029
+```
+
+Setup:
+
+```text
+initialized from the same selector-only coef 0.35 checkpoint
+no direct task id
+selector_latent_cmd_only = true
+selector_only = false
+continuous residuals enabled
+frozen latent_cmd_selector = true
+frozen RMA = true
+trained for 30 iterations instead of 100
+```
+
+Result:
+
+```text
+reference top gait vs learned top gait = 11 / 17
+confidence-weighted match = 0.879
+high-confidence rows = 7 / 7
+
+learned top gait count:
+  pronking = 6 / 17
+  trotting = 11 / 17
+  bounding = 0 / 17
+  pacing = 0 / 17
+
+avg reward = 0.7849
+avg vx_err = 0.3581
+```
+
+Comparison:
+
+```text
+selector-only coef 0.35:
+  avg reward = 0.8195
+  avg vx_err = 0.3533
+  high-confidence rows = 7 / 7
+
+staged full-action, frozen selector/RMA, 100 iterations:
+  avg reward = 0.7681
+  avg vx_err = 0.3659
+  high-confidence rows = 7 / 7
+
+staged full-action, frozen selector/RMA, 30 iterations:
+  avg reward = 0.7849
+  avg vx_err = 0.3581
+  high-confidence rows = 7 / 7
+```
+
+Interpretation:
+
+```text
+The shorter staged run is healthier than the 100-iteration staged run, but it
+still does not beat the selector-only checkpoint. The gait structure is no
+longer the failing part: ramp 1.5 pronking is preserved and all high-confidence
+rows remain correct.
+
+The current failing part is continuous residual adaptation. The residual branch
+mainly increases foot swing height/clearance and lowers frequency somewhat, but
+that has not improved average reward or speed tracking. More residual training
+is unlikely to solve this by itself.
+
+Next work should constrain or regularize the continuous residual branch rather
+than training it longer. The cheapest next test is a staged run with smaller
+continuous-branch learning pressure, such as a smaller learning rate or an
+explicit residual-magnitude penalty.
+```
+
+2026-06-29 smaller-learning-rate staged diagnostic result:
+
+```text
+runs/high_level_oracle_gait/20260628_v4_physical_notask_zcmd_fullaction_from_selector_coef035_freeze_selector_rma_lr1e4_iter030/independent_eval/20260628_training_range_iter029
+```
+
+补点评测:
+
+```text
+push_lateral_pace_recovery:1.2 has now been evaluated separately:
+  reward = 0.7528
+  vx_err = 0.3610
+  pronking ratio = 0.090
+  trotting ratio = 0.910
+
+push_lateral_pace_recovery:1.8 has now been evaluated separately:
+  reward = 0.7218
+  vx_err = 0.6396
+  pronking ratio = 0.029
+  trotting ratio = 0.971
+
+stepping_stones_easy_bound_highspeed:1.7 has now been evaluated separately:
+  reward = 0.7364
+  vx_err = 0.6291
+  pronking ratio = 0.009
+  trotting ratio = 0.991
+```
+
+Final comparison on the full 17 training-range rows:
+
+```text
+selector-only coef 0.35:
+  match = 11 / 17
+  high-confidence rows = 7 / 7
+  avg reward = 0.8195
+  avg vx_err = 0.3533
+  avg footswing_height = 0.0800
+  avg frequency = 3.0000
+
+staged full-action, frozen selector/RMA, lr=3e-4, 30 iterations:
+  match = 11 / 17
+  high-confidence rows = 7 / 7
+  avg reward = 0.7849
+  avg vx_err = 0.3581
+  avg footswing_height = 0.0865
+  avg frequency = 2.9199
+
+staged full-action, frozen selector/RMA, lr=1e-4, 30 iterations:
+  match = 11 / 17
+  high-confidence rows = 7 / 7
+  avg reward = 0.7864
+  avg vx_err = 0.3629
+  avg footswing_height = 0.0824
+  avg frequency = 2.8866
+```
+
+Interpretation:
+
+```text
+Reducing the learning rate from 3e-4 to 1e-4 does not solve the continuous
+residual problem. On the full 17-row training-range evaluation, lr=1e-4 slightly
+improves reward over the lr=3e-4 30-iteration staged run, but speed error is
+worse, and both staged full-action runs remain clearly below the selector-only
+baseline.
+
+This supports the same conclusion: the gait structure is preserved, but the
+continuous residual branch is not producing useful parameter adaptation. The
+next real fix should add an explicit residual-magnitude penalty or reduce the
+allowed residual action range, rather than just lowering the learning rate.
+```
+
+Implementation update:
+
+```text
+scripts/evaluate_high_level_policy_by_task.py now supports:
+
+--force-zero-residuals
+
+This diagnostic keeps the model's gait-selection output but sets all five
+continuous residual actions to zero before stepping the environment. The script
+also records requested_residual_* and executed_residual_* columns so we can
+separate what the model wanted to output from what was actually executed after
+forcing/smoothing.
+```
+
+Purpose:
+
+```text
+Use the same full-action checkpoint twice:
+  A. normal evaluation with learned continuous residuals;
+  B. force-zero-residual evaluation with the same gait selector.
+
+If B recovers the selector-only performance level, the continuous residual
+outputs are directly harming the policy. If B does not recover, the issue is
+not just residual magnitude and we need to inspect the staged training dynamics
+more broadly.
+```
+
+2026-06-29 force-zero-residual diagnostic result:
+
+```text
+runs/high_level_oracle_gait/20260628_v4_physical_notask_zcmd_fullaction_from_selector_coef035_freeze_selector_rma_lr1e4_iter030/independent_eval/20260629_training_range_iter029_force_zero_residuals
+```
+
+Full 17-row comparison:
+
+```text
+selector-only coef 0.35:
+  match = 11 / 17
+  high-confidence rows = 7 / 7
+  avg reward = 0.8195
+  avg vx_err = 0.3533
+  avg frequency = 3.0000
+  avg footswing_height = 0.0800
+
+normal staged full-action, lr=1e-4, 30 iterations:
+  match = 11 / 17
+  high-confidence rows = 7 / 7
+  avg reward = 0.7864
+  avg vx_err = 0.3629
+  avg frequency = 2.8866
+  avg footswing_height = 0.0824
+  avg executed residual abs = nonzero
+
+same checkpoint, forced continuous residuals to zero at evaluation:
+  match = 11 / 17
+  high-confidence rows = 7 / 7
+  avg reward = 0.8188
+  avg vx_err = 0.3561
+  avg frequency = 3.0000
+  avg footswing_height = 0.0800
+  avg requested residual abs = 0.3183
+  avg requested residual boundary rate = 0.0126
+  avg executed residual abs = 0.0000
+```
+
+Interpretation:
+
+```text
+This confirms that the continuous residual output is the source of the
+performance drop. The same checkpoint recovers almost selector-only reward when
+the residuals are forced to zero. The gait selector remains healthy; the
+residual branch is producing moderate nonzero offsets that hurt the physical
+objective.
+
+The residuals are not mostly saturating at the boundary: requested boundary
+rate is only about 1.26%. The issue is not boundary clipping, but that moderate
+deviations from the default gait template reduce reward and speed tracking.
+
+Next fix should be structural:
+  - initialize residual mean output near zero when starting from a selector-only
+    checkpoint;
+  - reduce residual exploration standard deviation for staged residual training;
+  - add a residual-magnitude penalty so the branch must earn any deviation from
+    the default template.
+```
+
+Implementation update:
+
+```text
+scripts/train_high_level_oracle_ppo.py now supports three explicit staged
+residual-training protections:
+
+--zero-init-residual-head
+  reset the continuous residual mean head to output zero after loading an init
+  checkpoint.
+
+--residual-std <value>
+  override the residual exploration standard deviation after checkpoint loading.
+
+--residual-l2-coef <value>
+  add a small PPO loss penalty on mean squared continuous residual actions.
+```
+
+Recommended next diagnostic:
+
+```text
+Start again from the selector-only coef 0.35 checkpoint, freeze gait selector
+and RMA, zero-initialize the residual head, use a smaller residual exploration
+std, and add a small residual L2 penalty. Train for 30 iterations, then evaluate
+the full 17-row training range.
+```
+
+Syntax check passed:
+
+```text
+python3 -m py_compile scripts/train_high_level_oracle_ppo.py \
+  scripts/evaluate_high_level_policy_by_task.py
+```
+
 Documentation rule:
 
 ```text
@@ -268,6 +1710,58 @@ Run probes before changing architecture:
 
 4. test whether replacing or zeroing the latent changes gait-selection
    probabilities.
+```
+
+The first no-task/RMA information-path probe is complete:
+
+```text
+runs/high_level_oracle_gait/info_path_probe/20260626_notask_rma_highconf_coef015
+analysis:
+  runs/high_level_oracle_gait/info_path_probe/20260626_notask_rma_highconf_coef015/analysis
+```
+
+Key result:
+
+```text
+The proprioceptive history contains usable information:
+  history -> speed test accuracy = 0.835
+  history -> high-confidence reference top gait test accuracy = 0.830
+
+The teacher latent strongly encodes task/reference information:
+  teacher latent -> task test accuracy = 0.941
+  teacher latent -> reference top gait test accuracy = 1.000
+
+But gait-selection probabilities barely change when the student latent is
+replaced by the teacher latent, zeroed, or shuffled:
+  student vs teacher mean probability difference = 0.0088
+  student vs zero-latent mean probability difference = 0.0077
+  student vs shuffled-latent mean probability difference = 0.0051
+
+Therefore the current dominant failure is that the gait-selection output is
+almost insensitive to the RMA latent. The next training-design step should make
+the gait selector use condition information, not continue reward tuning first.
+
+Immediate next experiment:
+
+```text
+Run a diagnostic policy where the gait selector can only use student latent plus
+command speed, with continuous residuals fixed at zero and high-confidence
+gait-reference rows active. This tests whether the latent itself is usable for
+gait selection once the full observation backbone can no longer bypass it.
+```
+
+Implemented flag:
+
+```text
+--selector-latent-cmd-only
+```
+
+Use it together with:
+
+```text
+--no-oracle-condition-obs
+--selector-only
+```
 ```
 ```
 

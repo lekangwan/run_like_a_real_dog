@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 import time
 
@@ -17,6 +18,8 @@ from gait_project_config import (
 from train_high_level_oracle_ppo import (
     GAIT_SHORT_NAMES,
     OracleConditionHighLevelEnv,
+    parse_residual_action_mask,
+    residual_mask_description,
     read_task_specs,
 )
 from train_high_level_ppo import ActorCritic, find_logdir, load_low_level_policy
@@ -29,12 +32,51 @@ def latest_checkpoint(run_dir):
     return checkpoints[-1]
 
 
-def load_model(checkpoint_path, obs_dim, num_gaits, residual_dim, device):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model = ActorCritic(obs_dim, num_gaits, residual_dim).to(device)
+def load_run_args(run_dir):
+    args_path = Path(run_dir) / "args.json"
+    if not args_path.exists():
+        return {}
+    with args_path.open() as file:
+        return json.load(file)
+
+
+def load_model(checkpoint_path, env, run_args):
+    checkpoint = torch.load(checkpoint_path, map_location=env.device)
+    obs_dim = int(run_args.get("obs_dim", env.obs_dim))
+    model = ActorCritic(
+        obs_dim,
+        env.num_gaits,
+        env.num_behavior_actions,
+        base_obs_dim=env.base_obs_dim,
+        priv_dim=int(run_args.get("priv_dim", 14)),
+        z_dim=int(run_args.get("z_dim", 16)),
+        selector_latent_cmd_only=bool(run_args.get("selector_latent_cmd_only", False)),
+        physical_aux_dim=int(run_args.get("physical_aux_dim", 0)),
+        selector_physical_state_input=bool(run_args.get("selector_physical_state_input", False)),
+    ).to(env.device)
     model.load_state_dict(checkpoint["model"])
+    residual_mask = run_args.get("residual_action_mask")
+    if residual_mask is None:
+        residual_mask = parse_residual_action_mask(run_args.get("residual_train_dims", "all"), device=env.device)
+    else:
+        residual_mask = torch.tensor(residual_mask, device=env.device)
+    model.set_residual_action_mask(residual_mask)
     model.eval()
     return model, int(checkpoint.get("iteration", -1))
+
+
+def augment_for_checkpoint(obs, task_ids, num_tasks, use_task_id):
+    if not use_task_id:
+        return obs
+    one_hot = torch.zeros(obs.shape[0], num_tasks, device=obs.device, dtype=obs.dtype)
+    one_hot[torch.arange(obs.shape[0], device=obs.device), task_ids.to(device=obs.device, dtype=torch.long)] = 1.0
+    return torch.cat((obs, one_hot), dim=-1)
+
+
+def append_command_vx_obs(obs, cmd_vx, enabled):
+    if not enabled:
+        return obs
+    return torch.cat((obs, cmd_vx[:, None].to(dtype=obs.dtype)), dim=-1)
 
 
 def set_deterministic_vx(env):
@@ -106,6 +148,11 @@ def main():
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else latest_checkpoint(args.run_dir)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    run_dir = checkpoint_path.parent.parent
+    run_args = load_run_args(run_dir)
+    oracle_condition_obs = not bool(run_args.get("no_oracle_condition_obs", False))
+    selector_only = bool(run_args.get("selector_only", False))
+    selector_latent_cmd_only = bool(run_args.get("selector_latent_cmd_only", False))
 
     specs = read_task_specs(args.task_map, style_reward_scale=0.0)
     num_envs = len(specs) * args.num_envs_per_task
@@ -117,26 +164,31 @@ def main():
         low_policy,
         num_envs,
         render=not args.no_render,
-        oracle_condition_obs=True,
+        oracle_condition_obs=False,
         terrain_size=args.terrain_size,
         edge_reset_margin=args.edge_reset_margin,
         teleport_thresh=args.teleport_thresh,
         mesh_type=args.mesh_type,
+        selector_hold_steps=int(run_args.get("selector_hold_steps", 3)),
     )
-    model, iteration = load_model(
-        checkpoint_path,
-        env.obs_dim,
-        env.num_gaits,
-        env.num_behavior_actions,
-        env.device,
-    )
+    model, iteration = load_model(checkpoint_path, env, run_args)
 
-    obs = env.reset()
+    base_obs = env.reset()
     if not args.sample_vx:
         set_deterministic_vx(env)
+    obs = augment_for_checkpoint(base_obs, env.assignment.task_ids, len(specs), oracle_condition_obs)
+    obs = append_command_vx_obs(obs, env.command_vx(), selector_latent_cmd_only)
 
     print(f"Loaded checkpoint: {checkpoint_path} iteration={iteration}")
-    print(f"num_envs={env.num_envs}, obs_dim={env.obs_dim}, action_dim={env.num_high_level_actions}")
+    print(
+        f"num_envs={env.num_envs}, obs_dim={env.obs_dim}, action_dim={env.num_high_level_actions}, "
+        f"oracle_condition_obs={oracle_condition_obs}, selector_only={selector_only}, "
+        f"selector_latent_cmd_only={selector_latent_cmd_only}"
+    )
+    print(
+        "residual_train_dims="
+        f"{residual_mask_description(model.residual_action_mask.detach().cpu())}"
+    )
     print_scene_layout(env)
 
     reward_sum = 0.0
@@ -144,8 +196,15 @@ def main():
     vx_error_sum = 0.0
     with torch.inference_mode():
         for step in range(args.steps):
-            action = model.act_inference(obs)
-            obs, reward, done, _ = env.step(action)
+            if selector_only:
+                action = model.act_student_selector_only(obs)
+            else:
+                action = model.act_student(obs)
+            next_base_obs, reward, done, _ = env.step(action)
+            if not args.sample_vx:
+                set_deterministic_vx(env)
+            obs = augment_for_checkpoint(next_base_obs, env.assignment.task_ids, len(specs), oracle_condition_obs)
+            obs = append_command_vx_obs(obs, env.command_vx(), selector_latent_cmd_only)
             vx_error = torch.abs(env.measured_vx() - env.command_vx())
             reward_sum += reward.mean().item()
             done_sum += done.float().mean().item()

@@ -126,15 +126,42 @@ class ActorCritic(nn.Module):
         z_dim=16,
         hidden_dims=(256, 256),
         init_std=0.5,
+        selector_latent_cmd_only=False,
+        physical_aux_dim=0,
+        selector_physical_state_input=False,
     ):
         super().__init__()
         self.z_dim = z_dim
         self.num_gaits = num_gaits
         self.residual_dim = residual_dim
+        self.selector_latent_cmd_only = bool(selector_latent_cmd_only)
+        self.selector_physical_state_input = bool(selector_physical_state_input)
+        self.selector_latent_cmd_dim = z_dim + 1 if self.selector_latent_cmd_only else 0
+        self.physical_aux_dim = int(physical_aux_dim)
+        if self.selector_physical_state_input:
+            if not self.selector_latent_cmd_only:
+                raise ValueError("selector_physical_state_input requires selector_latent_cmd_only")
+            if z_dim <= 0:
+                raise ValueError("selector_physical_state_input requires z_dim > 0")
+            if self.physical_aux_dim <= 0:
+                raise ValueError("selector_physical_state_input requires physical_aux_dim > 0")
 
         # ── actor ──
         actor_input_dim = obs_dim + z_dim  # = obs_dim when z_dim == 0
         self.actor = HybridActor(actor_input_dim, num_gaits, residual_dim, hidden_dims)
+        if self.selector_latent_cmd_only:
+            selector_layers = []
+            selector_input_dim = self.selector_latent_cmd_dim
+            if self.selector_physical_state_input:
+                selector_input_dim += self.physical_aux_dim
+            last_dim = selector_input_dim
+            for hidden_dim in hidden_dims:
+                selector_layers += [nn.Linear(last_dim, hidden_dim), nn.ELU()]
+                last_dim = hidden_dim
+            selector_layers.append(nn.Linear(last_dim, num_gaits))
+            self.latent_cmd_selector = nn.Sequential(*selector_layers)
+        else:
+            self.latent_cmd_selector = None
 
         # ── critic ──
         critic_layers = []
@@ -146,6 +173,11 @@ class ActorCritic(nn.Module):
         self.critic = nn.Sequential(*critic_layers)
 
         self.log_std = nn.Parameter(torch.log(torch.ones(residual_dim) * init_std))
+        self.register_buffer(
+            "residual_action_mask",
+            torch.ones(residual_dim),
+            persistent=False,
+        )
 
         # ── RMA modules (skipped when z_dim == 0) ──
         if z_dim > 0:
@@ -164,9 +196,49 @@ class ActorCritic(nn.Module):
                 nn.ELU(),
                 nn.Linear(128, z_dim),
             )
+            if self.physical_aux_dim > 0:
+                self.physical_state_head = nn.Sequential(
+                    nn.Linear(z_dim, 64),
+                    nn.ELU(),
+                    nn.Linear(64, self.physical_aux_dim),
+                )
+            else:
+                self.physical_state_head = None
         else:
             self.terrain_encoder = None
             self.adaptation_module = None
+            self.physical_state_head = None
+
+    def zero_init_selector_head(self):
+        """Start categorical gait selection from uniform logits."""
+        if self.latent_cmd_selector is not None:
+            head = self.latent_cmd_selector[-1]
+        else:
+            head = self.actor.gait_head
+        if not isinstance(head, nn.Linear):
+            raise TypeError(f"Expected final selector head to be nn.Linear, got {type(head)!r}")
+        nn.init.zeros_(head.weight)
+        nn.init.zeros_(head.bias)
+
+    def distribution_params(self, obs):
+        gait_logits, residual_mean = self.actor.distribution_params(obs)
+        if self.latent_cmd_selector is not None:
+            selector_obs = obs[:, -self.selector_latent_cmd_dim :]
+            if self.selector_physical_state_input:
+                if self.physical_state_head is None:
+                    raise RuntimeError("selector_physical_state_input requires physical_state_head")
+                z_for_selector = selector_obs[:, 1:]
+                physical_selector_obs = self.physical_state_head(z_for_selector).detach()
+                selector_obs = torch.cat((selector_obs, physical_selector_obs), dim=-1)
+            gait_logits = self.latent_cmd_selector(selector_obs)
+        residual_mean = residual_mean * self.residual_action_mask.to(device=residual_mean.device, dtype=residual_mean.dtype)
+        return gait_logits, residual_mean
+
+    def set_residual_action_mask(self, mask):
+        mask_tensor = torch.as_tensor(mask, dtype=self.residual_action_mask.dtype, device=self.residual_action_mask.device)
+        if mask_tensor.numel() != self.residual_dim:
+            raise ValueError(f"Expected residual mask with {self.residual_dim} values, got {mask_tensor.numel()}")
+        self.residual_action_mask.copy_(mask_tensor.reshape_as(self.residual_action_mask))
 
     def encode_teacher(self, privileged_obs):
         """Encode privileged simulation info → z_teacher (training only).
@@ -186,18 +258,30 @@ class ActorCritic(nn.Module):
             return None
         return self.adaptation_module(proprioceptive_history)
 
+    def predict_physical_state(self, z_student):
+        """Predict generic physical state from student latent for clean auxiliary training."""
+        if self.physical_state_head is None:
+            return None
+        return self.physical_state_head(z_student)
+
     def distribution(self, obs):
-        gait_logits, residual_mean = self.actor.distribution_params(obs)
+        gait_logits, residual_mean = self.distribution_params(obs)
         residual_std = torch.exp(self.log_std).expand_as(residual_mean)
         return Categorical(logits=gait_logits), Normal(residual_mean, residual_std)
+
+    def _residual_mask_for(self, tensor):
+        return self.residual_action_mask.to(device=tensor.device, dtype=tensor.dtype).view(1, -1)
 
     def act(self, obs):
         gait_dist, residual_dist = self.distribution(obs)
         gait_id = gait_dist.sample()
         gait_one_hot = F.one_hot(gait_id, num_classes=self.num_gaits).to(dtype=obs.dtype)
-        residual_action = torch.clamp(residual_dist.sample(), -1.0, 1.0)
+        raw_residual_action = torch.clamp(residual_dist.sample(), -1.0, 1.0)
+        residual_mask = self._residual_mask_for(raw_residual_action)
+        residual_action = raw_residual_action * residual_mask
         action = torch.cat((gait_one_hot, residual_action), dim=-1)
-        log_prob = gait_dist.log_prob(gait_id) + residual_dist.log_prob(residual_action).sum(dim=-1)
+        residual_log_prob = (residual_dist.log_prob(raw_residual_action) * residual_mask).sum(dim=-1)
+        log_prob = gait_dist.log_prob(gait_id) + residual_log_prob
         value = self.critic(obs).squeeze(-1)
         return action, log_prob, value
 
@@ -216,8 +300,11 @@ class ActorCritic(nn.Module):
         gait_dist, residual_dist = self.distribution(obs)
         gait_id = torch.argmax(actions[:, : self.num_gaits], dim=-1)
         residual_action = actions[:, self.num_gaits :]
-        log_prob = gait_dist.log_prob(gait_id) + residual_dist.log_prob(residual_action).sum(dim=-1)
-        entropy = gait_dist.entropy() + residual_dist.entropy().sum(dim=-1)
+        residual_mask = self._residual_mask_for(residual_action)
+        residual_log_prob = (residual_dist.log_prob(residual_action) * residual_mask).sum(dim=-1)
+        residual_entropy = (residual_dist.entropy() * residual_mask).sum(dim=-1)
+        log_prob = gait_dist.log_prob(gait_id) + residual_log_prob
+        entropy = gait_dist.entropy() + residual_entropy
         value = self.critic(obs).squeeze(-1)
         return log_prob, entropy, value
 
@@ -236,11 +323,15 @@ class ActorCritic(nn.Module):
 
     def act_inference(self, obs):
         """Deterministic forward pass for evaluation / deployment."""
-        return self.actor(obs)
+        gait_logits, residual_mean = self.distribution_params(obs)
+        gait_ids = torch.argmax(gait_logits, dim=-1)
+        gait_one_hot = F.one_hot(gait_ids, num_classes=self.num_gaits).to(dtype=residual_mean.dtype)
+        residual_action = residual_mean * self._residual_mask_for(residual_mean)
+        return torch.cat((gait_one_hot, residual_action), dim=-1)
 
     def act_inference_selector_only(self, obs):
         """Deterministic selector-only forward pass with zero residuals."""
-        gait_logits, _ = self.actor.distribution_params(obs)
+        gait_logits, _ = self.distribution_params(obs)
         gait_ids = torch.argmax(gait_logits, dim=-1)
         gait_one_hot = F.one_hot(gait_ids, num_classes=self.num_gaits).to(dtype=obs.dtype)
         residual_action = torch.zeros(obs.shape[0], self.residual_dim, device=obs.device, dtype=obs.dtype)
@@ -258,12 +349,12 @@ class ActorCritic(nn.Module):
             action: [N, num_gaits + residual_dim] high-level action.
         """
         if self.z_dim == 0:
-            return self.actor(obs)
+            return self.act_inference(obs)
         base_dim = self.adaptation_module[0].in_features
         base_obs = obs[:, :base_dim]
         z = self.adaptation_module(base_obs)
         aug_obs = torch.cat((obs, z), dim=-1)
-        return self.actor(aug_obs)
+        return self.act_inference(aug_obs)
 
     def act_student_selector_only(self, obs):
         """Student-only deterministic inference with fixed zero residuals."""
