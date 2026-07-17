@@ -86,6 +86,9 @@ def load_model(checkpoint_path, env, run_args):
         selector_latent_cmd_only=bool(run_args.get("selector_latent_cmd_only", False)),
         physical_aux_dim=int(run_args.get("physical_aux_dim", 0)),
         selector_physical_state_input=bool(run_args.get("selector_physical_state_input", False)),
+        adaptation_temporal_summary=bool(run_args.get("adaptation_temporal_summary", False)),
+        gait_conditioned_residuals=bool(run_args.get("gait_conditioned_residuals", False)),
+        gait_input_residuals=bool(run_args.get("gait_input_residuals", False)),
     ).to(env.device)
     model.load_state_dict(checkpoint["model"])
     residual_mask = run_args.get("residual_action_mask")

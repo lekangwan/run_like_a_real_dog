@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import random
 import subprocess
 import sys
 import time
@@ -9,8 +10,10 @@ import time
 import isaacgym
 
 assert isaacgym
+import numpy as np
 import torch
 
+from go2_gym.envs.wrappers.high_level_reward_metrics import CANONICAL_REWARD_NAMES
 from gait_project_config import (
     MAINLINE_TASK_MAP,
     TRAIN_EDGE_RESET_MARGIN,
@@ -58,13 +61,31 @@ QUICK_EVAL = (
     "stepping_stones_easy_bound_highspeed:2.0"
 )
 
-SCORE_KEYS = (
-    "score_progress",
-    "score_slip",
-    "score_orientation",
-    "score_lateral_drift",
-    "score_clearance",
-    "score_action_boundary_margin",
+SCORE_KEYS = tuple(f"score_{name}" for name in CANONICAL_REWARD_NAMES)
+RAW_TERM_KEYS = (
+    "velocity_reward",
+    "yaw_reward",
+    "orientation_penalty",
+    "pitch_rate_penalty",
+    "roll_rate_penalty",
+    "yaw_rate_penalty",
+    "lateral_velocity_penalty",
+    "lateral_position_penalty",
+    "vertical_velocity_penalty",
+    "slip_penalty",
+    "contact_slip_penalty",
+    "torque_penalty",
+    "mechanical_power_abs",
+    "transport_cost_proxy",
+    "impact_velocity_rms",
+    "scuffing_ratio",
+    "clearance_reward",
+    "gait_switch_penalty",
+    "action_delta_penalty",
+    "continuous_action_penalty",
+    "action_boundary_penalty",
+    "fall_penalty",
+    "weighted_metric_reward",
 )
 
 
@@ -104,6 +125,9 @@ def load_model(checkpoint_path, env, run_args):
         selector_latent_cmd_only=bool(run_args.get("selector_latent_cmd_only", False)),
         physical_aux_dim=int(run_args.get("physical_aux_dim", 0)),
         selector_physical_state_input=bool(run_args.get("selector_physical_state_input", False)),
+        adaptation_temporal_summary=bool(run_args.get("adaptation_temporal_summary", False)),
+        gait_conditioned_residuals=bool(run_args.get("gait_conditioned_residuals", False)),
+        gait_input_residuals=bool(run_args.get("gait_input_residuals", False)),
     ).to(env.device)
     model.load_state_dict(checkpoint["model"])
     residual_mask = run_args.get("residual_action_mask")
@@ -179,6 +203,7 @@ def make_stats(num_envs):
         "stance_width_sum": 0.0,
         "body_pitch_sum": 0.0,
         "score_sums": {key: 0.0 for key in SCORE_KEYS},
+        "raw_term_sums": {key: 0.0 for key in RAW_TERM_KEYS},
         "gait_counts": {name: 0 for name in GAIT_NAMES},
         "last_gait_ids": torch.full((num_envs,), -1, dtype=torch.long),
         "dwell_lengths": [],
@@ -243,6 +268,9 @@ def add_step_stats(stats, env, action, reward, done, info, requested_action=None
     for key in SCORE_KEYS:
         if key in terms:
             stats["score_sums"][key] += float(terms[key].sum().item())
+    for key in RAW_TERM_KEYS:
+        if key in terms:
+            stats["raw_term_sums"][key] += float(terms[key].sum().item())
 
 
 def finalize_stats(stats, task_id, condition, target_gait, vx):
@@ -279,6 +307,8 @@ def finalize_stats(stats, task_id, condition, target_gait, vx):
         row[f"{GAIT_SHORT_NAMES[gait_name]}_ratio"] = stats["gait_counts"][gait_name] / steps
     for key in SCORE_KEYS:
         row[key] = stats["score_sums"][key] / steps
+    for key in RAW_TERM_KEYS:
+        row[key] = stats["raw_term_sums"][key] / steps
     return row
 
 
@@ -292,11 +322,13 @@ def write_csv(path, rows):
 
 
 def write_summary(path, rows, checkpoint_path, iteration):
+    decision_interval = int(float(rows[0].get("decision_interval", 1))) if rows else 1
     lines = [
         "# Independent High-Level Policy Evaluation",
         "",
         f"- checkpoint: `{checkpoint_path}`",
         f"- checkpoint_iteration: {iteration}",
+        f"- decision_interval: {decision_interval}",
         "",
         "| task | vx | target | pronk | trot | bound | pace | switch | dwell | vx_err | progress | slip | orientation | clearance | foot | clip | req_res | exec_res |",
         "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -318,8 +350,9 @@ def write_summary(path, rows, checkpoint_path, iteration):
 
 def run_child_evals(args, eval_items, output_dir):
     rows = []
-    for spec, _task_index, vx in eval_items:
+    for item_index, (spec, _task_index, vx) in enumerate(eval_items):
         child_dir = output_dir / f"{spec.task_id}_vx{vx:.2f}".replace(".", "p")
+        child_seed = args.seed + item_index
         cmd = [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -333,6 +366,8 @@ def run_child_evals(args, eval_items, output_dir):
             args.task_map,
             "--eval",
             f"{spec.task_id}:{vx}",
+            "--seed",
+            str(child_seed),
             "--num-envs",
             str(args.num_envs),
             "--steps",
@@ -355,6 +390,8 @@ def run_child_evals(args, eval_items, output_dir):
             cmd += ["--checkpoint", args.checkpoint]
         if args.reward_profile:
             cmd += ["--reward-profile", args.reward_profile]
+        if args.decision_interval is not None:
+            cmd += ["--decision-interval", str(args.decision_interval)]
         if args.render:
             cmd.append("--render")
         if args.force_zero_residuals:
@@ -382,6 +419,7 @@ def print_row(row):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--run-dir", default="runs/high_level_oracle_gait/20260610_rma_notask_reward_v4")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--label", default="gait-conditioned-agility/pretrain-go2/train")
@@ -392,6 +430,15 @@ def main():
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--warmup-steps", type=int, default=50)
+    parser.add_argument(
+        "--decision-interval",
+        type=int,
+        default=None,
+        help=(
+            "High-level action hold length during evaluation. Defaults to the "
+            "training decision_interval stored in args.json."
+        ),
+    )
     parser.add_argument("--terrain-size", type=float, default=TRAIN_TERRAIN_SIZE)
     parser.add_argument("--edge-reset-margin", type=float, default=TRAIN_EDGE_RESET_MARGIN)
     parser.add_argument("--teleport-thresh", type=float, default=TRAIN_TELEPORT_THRESH)
@@ -419,9 +466,23 @@ def main():
     parser.add_argument("--no-spawn", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     run_dir = Path(args.run_dir)
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else latest_checkpoint(run_dir)
     run_args = load_run_args(run_dir)
+    decision_interval = int(
+        args.decision_interval
+        if args.decision_interval is not None
+        else run_args.get("decision_interval", 1)
+    )
+    if decision_interval < 1:
+        raise ValueError("--decision-interval must be >= 1")
+    args.decision_interval = decision_interval
     reward_profile = args.reward_profile or run_args.get("reward_profile", "task_focus_v4")
     oracle_condition_obs = not bool(run_args.get("no_oracle_condition_obs", False))
     selector_only = bool(run_args.get("selector_only", False))
@@ -459,7 +520,8 @@ def main():
     print(
         f"oracle_condition_obs={oracle_condition_obs}, "
         f"selector_only={selector_only}, force_zero_residuals={args.force_zero_residuals}, "
-        f"eval_items={len(eval_items)}, reward_profile={reward_profile}"
+        f"eval_items={len(eval_items)}, reward_profile={reward_profile}, "
+        f"decision_interval={decision_interval}"
     )
     residual_mask = run_args.get("residual_action_mask")
     if residual_mask is None:
@@ -488,16 +550,19 @@ def main():
         obs = append_command_vx_obs(obs, env.command_vx(), selector_latent_cmd_only)
         stats = make_stats(env.num_envs)
 
+        action = None
+        requested_action = None
         with torch.inference_mode():
             for step in range(args.steps + args.warmup_steps):
-                if selector_only:
-                    action = model.act_student_selector_only(obs)
-                else:
-                    action = model.act_student(obs)
-                requested_action = action
-                if args.force_zero_residuals:
-                    action = action.clone()
-                    action[:, env.num_gaits :] = 0.0
+                if action is None or step % decision_interval == 0:
+                    if selector_only:
+                        requested_action = model.act_student_selector_only(obs)
+                    else:
+                        requested_action = model.act_student(obs)
+                    action = requested_action
+                    if args.force_zero_residuals:
+                        action = action.clone()
+                        action[:, env.num_gaits :] = 0.0
                 next_obs, reward, done, info = env.step(action)
                 set_fixed_vx(env, vx)
                 obs = augment_for_checkpoint(next_obs, task_index, len(all_specs), oracle_condition_obs)
@@ -506,6 +571,8 @@ def main():
                     add_step_stats(stats, env, action, reward, done, info, requested_action=requested_action)
 
         row = finalize_stats(stats, spec.task_id, spec.condition, spec.target_gait, vx)
+        row["seed"] = args.seed
+        row["decision_interval"] = decision_interval
         rows.append(row)
         print_row(row)
 

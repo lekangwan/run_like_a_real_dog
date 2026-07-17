@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 from pathlib import Path
 import time
@@ -53,6 +54,9 @@ def load_model(checkpoint_path, env, run_args):
         selector_latent_cmd_only=bool(run_args.get("selector_latent_cmd_only", False)),
         physical_aux_dim=int(run_args.get("physical_aux_dim", 0)),
         selector_physical_state_input=bool(run_args.get("selector_physical_state_input", False)),
+        adaptation_temporal_summary=bool(run_args.get("adaptation_temporal_summary", False)),
+        gait_conditioned_residuals=bool(run_args.get("gait_conditioned_residuals", False)),
+        gait_input_residuals=bool(run_args.get("gait_input_residuals", False)),
     ).to(env.device)
     model.load_state_dict(checkpoint["model"])
     residual_mask = run_args.get("residual_action_mask")
@@ -89,6 +93,32 @@ def set_deterministic_vx(env):
         vx_cmd[env_ids] = values.repeat(repeats)[: len(env_ids)]
     env.vx_cmd[:] = vx_cmd
     env.env.set_velocity_command(env.vx_cmd, 0.0, 0.0)
+
+
+def select_eval_specs(specs, eval_text):
+    """Restrict playback to task:speed entries without changing training data."""
+    if not eval_text:
+        return specs
+    by_task = {spec.task_id: spec for spec in specs}
+    selected = []
+    for raw_item in str(eval_text).split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError("Playback --eval entries must use task_id:vx, for example flat_trot_efficiency:0.5")
+        task_id, vx_text = item.split(":", 1)
+        if task_id not in by_task:
+            raise ValueError(f"Unknown playback task_id={task_id!r}. Choices: {sorted(by_task)}")
+        spec = copy.copy(by_task[task_id])
+        vx = float(vx_text)
+        spec.vx_values = [vx]
+        spec.vx_low = vx
+        spec.vx_high = vx
+        selected.append(spec)
+    if not selected:
+        raise ValueError("No playback eval items requested")
+    return selected
 
 
 def print_scene_layout(env):
@@ -131,6 +161,11 @@ def main():
     parser.add_argument("--label", default="gait-conditioned-agility/pretrain-go2/train")
     parser.add_argument("--run-index", type=int, default=0)
     parser.add_argument("--task-map", default=str(MAINLINE_TASK_MAP))
+    parser.add_argument(
+        "--eval",
+        default=None,
+        help="Only play selected task:speed entries, such as flat_trot_efficiency:0.5",
+    )
     parser.add_argument("--num-envs-per-task", type=int, default=4)
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--print-interval", type=int, default=200)
@@ -155,6 +190,7 @@ def main():
     selector_latent_cmd_only = bool(run_args.get("selector_latent_cmd_only", False))
 
     specs = read_task_specs(args.task_map, style_reward_scale=0.0)
+    specs = select_eval_specs(specs, args.eval)
     num_envs = len(specs) * args.num_envs_per_task
     logdir = find_logdir(args.label, args.run_index)
     low_policy = load_low_level_policy(logdir)

@@ -21,6 +21,35 @@ def standardize(train_x, test_x):
     return (train_x - mean) / std, (test_x - mean) / std
 
 
+def split_history(history, history_length):
+    if history.ndim != 2 or history.shape[1] % history_length != 0:
+        raise ValueError(
+            f"history shape {tuple(history.shape)} cannot be split into "
+            f"{history_length} time steps"
+        )
+    return history.reshape(history.shape[0], history_length, -1)
+
+
+def make_temporal_summary(history, history_length):
+    sequence = split_history(history, history_length)
+    if history_length > 1:
+        mean_abs_step_change = torch.diff(sequence, dim=1).abs().mean(dim=1)
+    else:
+        mean_abs_step_change = torch.zeros_like(sequence[:, 0])
+    return torch.cat(
+        [
+            sequence[:, -1],
+            sequence.mean(dim=1),
+            sequence.std(dim=1, unbiased=False),
+            sequence.amin(dim=1),
+            sequence.amax(dim=1),
+            sequence[:, -1] - sequence[:, 0],
+            mean_abs_step_change,
+        ],
+        dim=1,
+    )
+
+
 def train_linear_probe(features, labels, num_classes, seed=0, epochs=250, lr=0.05):
     valid = labels >= 0
     features = features[valid]
@@ -152,6 +181,56 @@ def summarize_by_task_speed(data, metadata):
     return rows
 
 
+def summarize_temporal_stability(metadata, num_envs):
+    if not num_envs or not metadata.get("child_dirs"):
+        return []
+    task_names = {int(k): v for k, v in metadata["task_id_by_index"].items()}
+    rows = []
+    for child_dir_text in metadata["child_dirs"]:
+        child_dir = Path(child_dir_text)
+        data_path = child_dir / "info_path_samples.npz"
+        if not data_path.exists():
+            continue
+        data = np.load(data_path, allow_pickle=True)
+        samples = int(data["task_index"].shape[0])
+        time_steps = samples // num_envs
+        if time_steps < 2:
+            continue
+        usable = time_steps * num_envs
+
+        z = data["z_student"][:usable].reshape(time_steps, num_envs, -1)
+        probs = data["gait_probs_student"][:usable].reshape(time_steps, num_envs, -1)
+        done = data["done"][:usable].reshape(time_steps, num_envs) > 0.5
+        valid = ~(done[:-1] | done[1:])
+        if not np.any(valid):
+            continue
+
+        z_delta = z[1:] - z[:-1]
+        prob_delta = probs[1:] - probs[:-1]
+        top_gait = np.argmax(probs, axis=-1)
+        switch = top_gait[1:] != top_gait[:-1]
+        sorted_probs = np.sort(probs.reshape(-1, probs.shape[-1]), axis=-1)
+
+        task_index = int(data["task_index"][0])
+        rows.append(
+            {
+                "task_id": task_names.get(task_index, str(task_index)),
+                "cmd_vx": float(data["cmd_vx"][0]),
+                "valid_pairs": int(valid.sum()),
+                "z_mean_abs_delta": float(np.abs(z_delta).mean(axis=-1)[valid].mean()),
+                "z_l2_delta": float(np.sqrt(np.square(z_delta).sum(axis=-1))[valid].mean()),
+                "gait_prob_mean_abs_delta": float(
+                    np.abs(prob_delta).mean(axis=-1)[valid].mean()
+                ),
+                "top_gait_switch_rate": float(switch[valid].mean()),
+                "gait_prob_margin_mean": float(
+                    np.mean(sorted_probs[:, -1] - sorted_probs[:, -2])
+                ),
+            }
+        )
+    return rows
+
+
 def write_csv(path, rows):
     if not rows:
         return
@@ -161,7 +240,7 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
-def write_summary(path, probe_rows, sensitivity_rows, task_rows):
+def write_summary(path, probe_rows, sensitivity_rows, task_rows, stability_rows=None):
     lines = [
         "# High-Level Information-Path Probe",
         "",
@@ -203,6 +282,25 @@ def write_summary(path, probe_rows, sensitivity_rows, task_rows):
             f"| {row.get('prob_pronking', 0.0):.3f} | {row.get('prob_trotting', 0.0):.3f} "
             f"| {row.get('prob_bounding', 0.0):.3f} | {row.get('prob_pacing', 0.0):.3f} |"
         )
+    if stability_rows:
+        lines += [
+            "",
+            "## Temporal Stability",
+            "",
+            "Adjacent samples refer to the same simulated robot and exclude pairs whose",
+            "sampled endpoints contain a reset.",
+            "",
+            "| task | vx | pairs | z_abs_delta | prob_abs_delta | top_switch | margin |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        for row in stability_rows:
+            lines.append(
+                f"| {row['task_id']} | {row['cmd_vx']:.2f} | {row['valid_pairs']} "
+                f"| {row['z_mean_abs_delta']:.4f} "
+                f"| {row['gait_prob_mean_abs_delta']:.4f} "
+                f"| {row['top_gait_switch_rate']:.3f} "
+                f"| {row['gait_prob_margin_mean']:.3f} |"
+            )
     Path(path).write_text("\n".join(lines) + "\n")
 
 
@@ -212,14 +310,41 @@ def main():
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--epochs", type=int, default=250)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--history-length", type=int, default=10)
+    parser.add_argument("--previous-action-dim", type=int, default=9)
+    parser.add_argument(
+        "--collection-num-envs",
+        type=int,
+        default=None,
+        help="Parallel environment count used during collection; enables temporal stability analysis.",
+    )
     args = parser.parse_args()
 
     data, metadata = load_data(args.input_dir)
     output_dir = Path(args.output_dir) if args.output_dir else Path(args.input_dir) / "analysis"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    history = torch.tensor(data["history"], dtype=torch.float32)
+    history_sequence = split_history(history, args.history_length)
+    if args.previous_action_dim < 0 or args.previous_action_dim >= history_sequence.shape[-1]:
+        raise ValueError(
+            f"previous-action dim must be in [0, {history_sequence.shape[-1] - 1}], "
+            f"got {args.previous_action_dim}"
+        )
+    sensor_sequence = (
+        history_sequence
+        if args.previous_action_dim == 0
+        else history_sequence[:, :, :-args.previous_action_dim]
+    )
+    sensor_history = sensor_sequence.reshape(sensor_sequence.shape[0], -1)
     features = {
-        "history": torch.tensor(data["history"], dtype=torch.float32),
+        "history": history,
+        "history_temporal_summary": make_temporal_summary(history, args.history_length),
+        "history_without_previous_action": sensor_history,
+        "history_temporal_summary_without_previous_action": make_temporal_summary(
+            sensor_history,
+            args.history_length,
+        ),
         "z_student": torch.tensor(data["z_student"], dtype=torch.float32),
         "z_teacher": torch.tensor(data["z_teacher"], dtype=torch.float32),
     }
@@ -264,12 +389,20 @@ def main():
 
     sensitivity_rows = summarize_probability_sensitivity(data)
     task_rows = summarize_by_task_speed(data, metadata)
+    stability_rows = summarize_temporal_stability(metadata, args.collection_num_envs)
 
     write_csv(output_dir / "probe_results.csv", probe_rows)
     write_csv(output_dir / "latent_sensitivity.csv", sensitivity_rows)
     write_csv(output_dir / "task_speed_gait_probabilities.csv", task_rows)
+    write_csv(output_dir / "temporal_stability.csv", stability_rows)
     (output_dir / "speed_label_values.json").write_text(json.dumps(speed_values, indent=2) + "\n")
-    write_summary(output_dir / "summary.md", probe_rows, sensitivity_rows, task_rows)
+    write_summary(
+        output_dir / "summary.md",
+        probe_rows,
+        sensitivity_rows,
+        task_rows,
+        stability_rows,
+    )
 
     print(f"Wrote: {output_dir / 'probe_results.csv'}")
     print(f"Wrote: {output_dir / 'latent_sensitivity.csv'}")

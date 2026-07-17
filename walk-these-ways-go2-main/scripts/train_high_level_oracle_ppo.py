@@ -2,6 +2,7 @@ import argparse
 import csv
 import gc
 import json
+import random
 from collections import defaultdict
 from pathlib import Path
 import pickle as pkl
@@ -11,6 +12,7 @@ import time
 import isaacgym
 
 assert isaacgym
+import numpy as np
 import torch
 
 from go2_gym import MINI_GYM_ROOT_DIR
@@ -478,7 +480,8 @@ def load_mixed_low_level_env(
     render,
     conditions,
     push_axes,
-    terrain_size,
+    terrain_length,
+    terrain_width,
     edge_reset_margin,
     teleport_thresh,
     mesh_type,
@@ -507,8 +510,8 @@ def load_mixed_low_level_env(
     Cfg.terrain.center_robots = False
     Cfg.terrain.measure_heights = True
     Cfg.terrain.mesh_type = mesh_type
-    Cfg.terrain.terrain_length = terrain_size
-    Cfg.terrain.terrain_width = terrain_size
+    Cfg.terrain.terrain_length = terrain_length
+    Cfg.terrain.terrain_width = terrain_width
     Cfg.terrain.teleport_thresh = teleport_thresh
     Cfg.terrain.edge_reset_robots = True
     Cfg.terrain.edge_reset_margin = edge_reset_margin
@@ -523,7 +526,8 @@ def load_mixed_low_level_env(
 
     print(
         f"Creating mixed oracle env: num_envs={num_envs}, mesh_type={mesh_type}, "
-        f"terrain_size={terrain_size:.1f}m, edge_reset_margin={edge_reset_margin:.1f}m"
+        f"terrain_length={terrain_length:.1f}m, terrain_width={terrain_width:.1f}m, "
+        f"edge_reset_margin={edge_reset_margin:.1f}m"
     )
     env = VelocityTrackingEasyEnv(sim_device="cuda:0", headless=not render, cfg=Cfg)
     return HistoryWrapper(env)
@@ -553,19 +557,24 @@ class OracleConditionHighLevelEnv:
         teleport_thresh=TRAIN_TELEPORT_THRESH,
         mesh_type=TRAIN_MESH_TYPE,
         selector_hold_steps=3,
+        terrain_length=None,
+        terrain_width=None,
     ):
         self.specs = specs
         self.oracle_condition_obs = oracle_condition_obs
 
         placeholder_device = "cpu"
         self.assignment = build_env_assignment(specs, num_envs, placeholder_device)
+        terrain_length = terrain_size if terrain_length is None else terrain_length
+        terrain_width = terrain_size if terrain_width is None else terrain_width
         low_env = load_mixed_low_level_env(
             logdir,
             num_envs,
             render,
             self.assignment.conditions,
             self.assignment.push_axes,
-            terrain_size,
+            terrain_length,
+            terrain_width,
             edge_reset_margin,
             teleport_thresh,
             mesh_type,
@@ -653,7 +662,17 @@ def add_gait_metrics(metrics, env, actions):
     last_actions = actions[-env.num_envs :]
 
     for gait_id, gait_name in enumerate(GAIT_NAMES):
-        metrics[f"gait_{GAIT_SHORT_NAMES[gait_name]}_ratio"] = (gait_ids == gait_id).float().mean().item()
+        short = GAIT_SHORT_NAMES[gait_name]
+        gait_mask = gait_ids == gait_id
+        metrics[f"gait_{short}_ratio"] = gait_mask.float().mean().item()
+        for residual_index, residual_name in enumerate(RESIDUAL_ACTION_NAMES):
+            if torch.any(gait_mask):
+                gait_residual = residual[gait_mask, residual_index]
+                metrics[f"gait_{short}_residual_{residual_name}_mean"] = gait_residual.mean().item()
+                metrics[f"gait_{short}_residual_{residual_name}_abs_mean"] = gait_residual.abs().mean().item()
+            else:
+                metrics[f"gait_{short}_residual_{residual_name}_mean"] = 0.0
+                metrics[f"gait_{short}_residual_{residual_name}_abs_mean"] = 0.0
 
     if repeats > 1:
         switch_seq = (gait_seq[1:] != gait_seq[:-1]).float()
@@ -759,8 +778,35 @@ def add_gait_speed_bin_advantage_metrics(metrics, env, actions, advantages, rewa
                 metrics[f"{key}_reward_mean"] = 0.0
 
 
+def add_task_gait_advantage_metrics(metrics, env, actions, advantages, rewards):
+    """Log sampled-action training signal for every task and gait pair."""
+    if actions.shape[0] % env.num_envs != 0:
+        raise ValueError(f"Expected actions to be a multiple of num_envs={env.num_envs}")
+    repeats = actions.shape[0] // env.num_envs
+    task_ids = env.assignment.task_ids.repeat(repeats)
+    gait_ids = torch.argmax(actions[:, : env.num_gaits], dim=-1)
+    for task_index, spec in enumerate(env.specs):
+        task_mask = task_ids == task_index
+        for gait_id, gait_name in enumerate(GAIT_NAMES):
+            short = GAIT_SHORT_NAMES[gait_name]
+            mask = task_mask & (gait_ids == gait_id)
+            key = f"sampled_{spec.task_id}_{short}"
+            count = int(mask.sum().item())
+            metrics[f"{key}_count"] = count
+            if count > 0:
+                gait_adv = advantages[mask]
+                metrics[f"{key}_adv_mean"] = gait_adv.mean().item()
+                metrics[f"{key}_adv_positive_rate"] = (gait_adv > 0.0).float().mean().item()
+                metrics[f"{key}_reward_mean"] = rewards[mask].mean().item()
+            else:
+                metrics[f"{key}_adv_mean"] = 0.0
+                metrics[f"{key}_adv_positive_rate"] = 0.0
+                metrics[f"{key}_reward_mean"] = 0.0
+
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--label", default="gait-conditioned-agility/pretrain-go2/train")
     parser.add_argument("--run-index", type=int, default=0)
     parser.add_argument("--task-map", default=str(MAINLINE_TASK_MAP))
@@ -785,6 +831,25 @@ def main():
     parser.add_argument("--clip", type=float, default=0.2)
     parser.add_argument("--entropy-coef", type=float, default=0.003)
     parser.add_argument("--value-coef", type=float, default=0.5)
+    parser.add_argument(
+        "--selector-option-reward-advantage",
+        action="store_true",
+        help=(
+            "Diagnostic selector-only mode: update the gait policy from the "
+            "normalized observed option reward instead of critic/GAE advantage. "
+            "The critic is still trained normally."
+        ),
+    )
+    parser.add_argument(
+        "--selector-option-reward-baseline",
+        choices=["global", "per-env-leave-one-out"],
+        default="global",
+        help=(
+            "Baseline for --selector-option-reward-advantage. The per-env "
+            "leave-one-out baseline compares each option only with other "
+            "decisions from the same parallel environment and uses no task id."
+        ),
+    )
     parser.add_argument("--save-dir", default=str(Path(MINI_GYM_ROOT_DIR) / "runs" / "high_level_oracle_gait"))
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--save-interval", type=int, default=50)
@@ -808,6 +873,18 @@ def main():
         ),
     )
     parser.add_argument("--terrain-size", type=float, default=TRAIN_TERRAIN_SIZE)
+    parser.add_argument(
+        "--terrain-length",
+        type=float,
+        default=None,
+        help="Forward terrain length in metres; defaults to --terrain-size.",
+    )
+    parser.add_argument(
+        "--terrain-width",
+        type=float,
+        default=None,
+        help="Lateral terrain width in metres; defaults to --terrain-size.",
+    )
     parser.add_argument("--edge-reset-margin", type=float, default=TRAIN_EDGE_RESET_MARGIN)
     parser.add_argument("--teleport-thresh", type=float, default=TRAIN_TELEPORT_THRESH)
     parser.add_argument("--mesh-type", default=TRAIN_MESH_TYPE, choices=["heightfield", "trimesh"])
@@ -848,6 +925,24 @@ def main():
         help="Weight of adaptation MSE loss in total training loss.",
     )
     parser.add_argument(
+        "--adaptation-temporal-summary",
+        action="store_true",
+        help=(
+            "Replace the flattened ten-step student history with deterministic "
+            "per-channel temporal statistics of the same dimension before the "
+            "adaptation MLP. This adds no task id or privileged deployment input."
+        ),
+    )
+    parser.add_argument(
+        "--student-latent-only",
+        action="store_true",
+        help=(
+            "Use the deployable student latent throughout training instead of "
+            "restarting the teacher-to-student mixing schedule. Intended for "
+            "checkpoint-initialized later curriculum stages."
+        ),
+    )
+    parser.add_argument(
         "--privileged-obs-mode",
         default="full",
         choices=("full", "clean_physics"),
@@ -884,6 +979,16 @@ def main():
             "Sample one high-level action and execute it for this many high-level "
             "environment steps before adding one PPO transition. Use with "
             "--selector-hold-steps 0 so sampled and executed gaits stay aligned."
+        ),
+    )
+    parser.add_argument(
+        "--continue-option-after-artificial-reset",
+        action="store_true",
+        help=(
+            "For multi-step high-level decisions, keep accumulating the same "
+            "option after terrain-edge resets and time limits. Physical failures "
+            "still terminate the option. This prevents finite simulation bounds "
+            "from becoming a gait-selection objective."
         ),
     )
     parser.add_argument(
@@ -940,7 +1045,10 @@ def main():
     parser.add_argument(
         "--freeze-rma",
         action="store_true",
-        help="Freeze both the student adaptation module and privileged teacher encoder.",
+        help=(
+            "Freeze the student adaptation module, privileged teacher encoder, "
+            "and physical-state prediction head when present."
+        ),
     )
     parser.add_argument(
         "--zero-init-residual-head",
@@ -948,6 +1056,24 @@ def main():
         help=(
             "Diagnostic staged-training option: reset the continuous residual "
             "mean head to output zero after loading an init checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--gait-conditioned-residuals",
+        action="store_true",
+        help=(
+            "Condition the continuous residual distribution on the sampled gait. "
+            "The actor keeps one shared residual head and adds a zero-initialized "
+            "gait-specific correction for each gait."
+        ),
+    )
+    parser.add_argument(
+        "--gait-input-residuals",
+        action="store_true",
+        help=(
+            "Feed the sampled gait code into one shared continuous residual "
+            "network. The network maps [shared state features, gait code] to "
+            "the five residual means without separate per-gait networks."
         ),
     )
     parser.add_argument(
@@ -972,8 +1098,9 @@ def main():
         type=float,
         default=0.0,
         help=(
-            "Extra PPO loss weight on mean squared continuous residual actions. "
-            "Use only for staged residual diagnostics; default keeps old behavior."
+            "Extra PPO loss weight on the squared continuous residual mean for "
+            "the sampled gait. This keeps staged residual tuning near the default "
+            "template; default keeps old behavior."
         ),
     )
     parser.add_argument(
@@ -994,6 +1121,11 @@ def main():
         help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     if args.decision_interval < 1:
         raise ValueError("--decision-interval must be >= 1")
     if args.num_physical_steps is not None:
@@ -1007,6 +1139,24 @@ def main():
             "Otherwise the wrapper can execute a previously held gait while PPO "
             "credits the newly sampled gait."
         )
+    if args.gait_conditioned_residuals and args.selector_hold_steps != 0:
+        raise ValueError(
+            "--gait-conditioned-residuals requires --selector-hold-steps 0. "
+            "Otherwise the wrapper may execute a held gait with residuals sampled "
+            "for a different requested gait."
+        )
+    if args.gait_input_residuals and args.selector_hold_steps != 0:
+        raise ValueError(
+            "--gait-input-residuals requires --selector-hold-steps 0. "
+            "Otherwise the wrapper may execute a held gait with residuals sampled "
+            "for a different requested gait."
+        )
+    if args.gait_conditioned_residuals and args.gait_input_residuals:
+        raise ValueError(
+            "--gait-conditioned-residuals and --gait-input-residuals are mutually exclusive"
+        )
+    if args.selector_option_reward_advantage and not args.selector_only:
+        raise ValueError("--selector-option-reward-advantage requires --selector-only")
 
     reward_status = REWARD_PROFILE_STATUS.get(args.reward_profile, "unknown")
     if reward_status != "validated_for_training" and not args.allow_diagnostic_reward_profile:
@@ -1040,6 +1190,8 @@ def main():
         teleport_thresh=args.teleport_thresh,
         mesh_type=args.mesh_type,
         selector_hold_steps=args.selector_hold_steps,
+        terrain_length=args.terrain_length,
+        terrain_width=args.terrain_width,
     )
     device = env.device
     selector_target_table = load_selector_target_table(
@@ -1075,6 +1227,9 @@ def main():
         selector_latent_cmd_only=args.selector_latent_cmd_only,
         physical_aux_dim=physical_aux_dim,
         selector_physical_state_input=args.selector_physical_state_input,
+        adaptation_temporal_summary=args.adaptation_temporal_summary,
+        gait_conditioned_residuals=args.gait_conditioned_residuals,
+        gait_input_residuals=args.gait_input_residuals,
     ).to(device)
     residual_action_mask = parse_residual_action_mask(args.residual_train_dims, device=device)
     model.set_residual_action_mask(residual_action_mask)
@@ -1083,7 +1238,11 @@ def main():
     if args.init_checkpoint:
         checkpoint = torch.load(args.init_checkpoint, map_location=device)
         incompatible = model.load_state_dict(checkpoint["model"], strict=False)
-        allowed_missing_prefixes = ("physical_state_head.",)
+        allowed_missing_prefixes = (
+            "physical_state_head.",
+            "actor.gait_residual_delta_head.",
+            "actor.gait_input_residual_network.",
+        )
         unexpected = list(incompatible.unexpected_keys)
         disallowed_missing = [
             key for key in incompatible.missing_keys
@@ -1099,10 +1258,8 @@ def main():
             f"(iteration={checkpoint.get('iteration', 'unknown')})"
         )
     if args.zero_init_residual_head:
-        with torch.no_grad():
-            model.actor.residual_head.weight.zero_()
-            model.actor.residual_head.bias.zero_()
-        print("Zero-initialized continuous residual mean head.")
+        model.zero_init_residual_heads()
+        print("Zero-initialized all active continuous residual mean heads.")
     if args.zero_init_selector_head:
         model.zero_init_selector_head()
         print("Zero-initialized gait selector head; initial gait logits are uniform.")
@@ -1129,6 +1286,10 @@ def main():
             parameter.requires_grad_(False)
         frozen_modules.append("adaptation_module")
         frozen_modules.append("terrain_encoder")
+        if model.physical_state_head is not None:
+            for parameter in model.physical_state_head.parameters():
+                parameter.requires_grad_(False)
+            frozen_modules.append("physical_state_head")
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not trainable_parameters:
         raise RuntimeError("No trainable parameters remain after requested freezing.")
@@ -1166,6 +1327,29 @@ def main():
         args_dict["rollout_physical_steps"] = rollout_physical_steps
         args_dict["physical_aux_dim"] = physical_aux_dim
         args_dict["selector_physical_state_input"] = args.selector_physical_state_input
+        args_dict["adaptation_temporal_summary"] = args.adaptation_temporal_summary
+        args_dict["adaptation_temporal_summary_note"] = (
+            "When active, the student encoder receives first/last/mean/std/min/max/"
+            "delta/change/RMS summaries computed only from the existing ten-step "
+            "proprioceptive history. No task id or privileged deployment signal is added."
+        )
+        args_dict["student_latent_only_note"] = (
+            "When active, checkpoint-initialized curriculum stages use the "
+            "deployable student latent from the first update and do not restart "
+            "the teacher-to-student mixing schedule."
+        )
+        args_dict["gait_conditioned_residuals"] = args.gait_conditioned_residuals
+        args_dict["gait_conditioned_residuals_note"] = (
+            "The continuous action mean is a shared residual plus the correction "
+            "for the sampled gait. Gait-specific correction heads start at zero, "
+            "and only the selected gait's Normal distribution contributes to PPO."
+        )
+        args_dict["gait_input_residuals"] = args.gait_input_residuals
+        args_dict["gait_input_residuals_note"] = (
+            "One shared residual network receives shared state features plus the "
+            "sampled gait code and outputs five residual means. No complete "
+            "per-gait networks or additive per-gait correction heads are used."
+        )
         args_dict["target_gait_reward_active"] = any(
             float(spec.selector_reference_coef) > 0.0 for spec in specs
         )
@@ -1238,7 +1422,12 @@ def main():
             f"rollout_physical_steps={rollout_physical_steps} "
             f"selector_target_training={use_selector_targets}"
     )
-    print(f"Residual train dims: {residual_train_dims} mask={residual_action_mask.detach().cpu().tolist()}")
+    print(
+        f"Residual train dims: {residual_train_dims} "
+        f"mask={residual_action_mask.detach().cpu().tolist()} "
+        f"gait_conditioned={args.gait_conditioned_residuals} "
+        f"gait_input={args.gait_input_residuals}"
+    )
     if use_selector_targets:
         print(
             f"Using selector target table: {args.selector_targets} "
@@ -1266,7 +1455,9 @@ def main():
         progress = iteration / max(1, args.iterations - 1)
 
         # ── phase-dependent alpha: z_input = α * z_teacher + (1-α) * z_student ──
-        if progress < 0.25:
+        if args.student_latent_only:
+            alpha_val = 0.0
+        elif progress < 0.25:
             alpha_val = 1.0  # teacher-only
         elif progress < 0.75:
             alpha_val = 1.0 - (progress - 0.25) / 0.5  # linear anneal 1→0
@@ -1348,8 +1539,17 @@ def main():
 
                     active_float = option_active.to(dtype=reward.dtype)
                     option_reward += (args.gamma ** option_step) * reward * active_float
-                    option_done |= done.bool() & option_active
-                    option_active &= ~done.bool()
+                    terminal_done = done.bool()
+                    if args.continue_option_after_artificial_reset:
+                        artificial_reset = info.get("high_level_edge_resets")
+                        if artificial_reset is None:
+                            artificial_reset = torch.zeros_like(terminal_done)
+                        timeouts = info.get("high_level_timeouts")
+                        if timeouts is None:
+                            timeouts = torch.zeros_like(terminal_done)
+                        terminal_done = terminal_done & ~artificial_reset.bool() & ~timeouts.bool()
+                    option_done |= terminal_done & option_active
+                    option_active &= ~terminal_done
 
                     reward_sum += reward.mean().item()
                     done_sum += done.float().mean().item()
@@ -1411,6 +1611,22 @@ def main():
         buffer.compute_returns(last_value, option_gamma, args.lam)
 
         flat_obs, flat_actions, flat_log_probs, flat_returns, flat_advantages, _ = buffer.flat()
+        if args.selector_option_reward_advantage:
+            option_rewards = buffer.rewards.detach()
+            if args.selector_option_reward_baseline == "per-env-leave-one-out":
+                if rollout_decision_steps < 2:
+                    raise ValueError(
+                        "per-env-leave-one-out requires at least two decisions per rollout"
+                    )
+                other_mean = (
+                    option_rewards.sum(dim=0, keepdim=True) - option_rewards
+                ) / float(rollout_decision_steps - 1)
+                flat_option_rewards = (option_rewards - other_mean).flatten(0, 1)
+            else:
+                flat_option_rewards = option_rewards.flatten(0, 1)
+            flat_advantages = (
+                flat_option_rewards - flat_option_rewards.mean()
+            ) / (flat_option_rewards.std() + 1e-8)
         actual_actions_flat = torch.stack(actual_actions, dim=0).reshape(-1, env.num_high_level_actions)
         command_vx_flat = torch.stack(command_vx_steps, dim=0).reshape(-1)
         if use_selector_targets:
@@ -1511,8 +1727,17 @@ def main():
 
                 if args.residual_l2_coef > 0.0 and not args.selector_only:
                     active_count = torch.clamp(model.residual_action_mask.sum(), min=1.0)
+                    sampled_gait_ids = torch.argmax(
+                        flat_actions[idx, : env.num_gaits],
+                        dim=-1,
+                    )
+                    _, current_residual_mean = model.distribution_params(
+                        flat_obs[idx],
+                        gait_ids=sampled_gait_ids,
+                    )
                     residual_l2_loss = (
-                        flat_actions[idx, env.num_gaits :].pow(2) * model.residual_action_mask.view(1, -1)
+                        current_residual_mean.pow(2)
+                        * model.residual_action_mask.view(1, -1)
                     ).sum(dim=-1).mean() / active_count
                 else:
                     residual_l2_loss = torch.tensor(0.0, device=device)
@@ -1640,6 +1865,13 @@ def main():
             flat_advantages.detach(),
             buffer.rewards.flatten(0, 1).detach(),
             command_vx_flat.detach(),
+        )
+        add_task_gait_advantage_metrics(
+            metrics,
+            env,
+            flat_actions.detach(),
+            flat_advantages.detach(),
+            buffer.rewards.flatten(0, 1).detach(),
         )
         append_metrics(metrics_path, metrics)
 

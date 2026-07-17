@@ -537,3 +537,6 @@ Important runtime quirks:
   observations and gait-switch stability.
 - The success criterion is healthier metrics and visual behavior, not just a
   slightly higher scalar reward.
+
+
+

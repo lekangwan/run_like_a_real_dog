@@ -219,6 +219,8 @@ class HighLevelGaitWrapper:
 
         rewards = torch.zeros(self.num_envs, device=self.device)
         dones_accum = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        edge_resets_accum = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        timeouts_accum = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         info = {}
         reward_terms = None
         if self.record_reward_terms:
@@ -260,6 +262,8 @@ class HighLevelGaitWrapper:
                 low_action = self.low_level_policy(self.low_level_obs)
             self.low_level_obs, _, dones, info = self.env.step(low_action.to(self.device))
             rewards += self._compute_high_level_reward(dones)
+            edge_resets_accum |= self._get_edge_reset_buf()
+            timeouts_accum |= self._get_time_out_buf()
             if self.record_reward_terms:
                 for key, value in self.last_reward_terms.items():
                     reward_terms[key] += value
@@ -274,6 +278,9 @@ class HighLevelGaitWrapper:
             del low_action
 
         info["executed_high_level_action"] = self.high_level_action.detach().clone()
+        info["high_level_edge_resets"] = edge_resets_accum
+        info["high_level_timeouts"] = timeouts_accum
+        info["high_level_physical_dones"] = dones_accum & ~edge_resets_accum & ~timeouts_accum
         if torch.any(dones_accum):
             done_ids = dones_accum.nonzero(as_tuple=False).flatten()
             self.high_level_action[done_ids] = self.default_high_level_action[done_ids]
@@ -522,7 +529,8 @@ class HighLevelGaitWrapper:
         )
 
         edge_reset = self._get_edge_reset_buf()
-        fall_penalty = (dones.bool() & ~edge_reset).float()
+        time_out = self._get_time_out_buf()
+        fall_penalty = (dones.bool() & ~edge_reset & ~time_out).float()
         selector_reference_coef = self._get_selector_reference_coef()
         metric_scores = self._compute_metric_scores(
             velocity_reward=velocity_reward,
@@ -690,6 +698,12 @@ class HighLevelGaitWrapper:
         if edge_reset is None:
             return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         return edge_reset.to(device=self.device, dtype=torch.bool)
+
+    def _get_time_out_buf(self):
+        time_out = getattr(self._get_base_env(), "time_out_buf", None)
+        if time_out is None:
+            return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        return time_out.to(device=self.device, dtype=torch.bool)
 
     def _current_foot_contacts(self):
         return self.env.contact_forces[:, self.env.feet_indices, 2] > 1.0

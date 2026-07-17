@@ -57,8 +57,10 @@ class Terrain:
         cfg.num_sub_terrains = cfg.num_rows * cfg.num_cols
         cfg.env_origins = np.zeros((cfg.num_rows, cfg.num_cols, 3))
 
-        cfg.width_per_env_pixels = int(cfg.terrain_length / cfg.horizontal_scale)
-        cfg.length_per_env_pixels = int(cfg.terrain_width / cfg.horizontal_scale)
+        # Height-field rows follow the forward x direction (terrain length),
+        # while columns follow the lateral y direction (terrain width).
+        cfg.length_per_env_pixels = int(cfg.terrain_length / cfg.horizontal_scale)
+        cfg.width_per_env_pixels = int(cfg.terrain_width / cfg.horizontal_scale)
 
         cfg.border = int(cfg.border_size / cfg.horizontal_scale)
         cfg.tot_cols = int(cfg.num_cols * cfg.width_per_env_pixels) + 2 * cfg.border
@@ -93,7 +95,7 @@ class Terrain:
 
     def make_condition_terrain(self, cfg, condition, difficulty):
         terrain = terrain_utils.SubTerrain("terrain",
-                                           width=cfg.width_per_env_pixels,
+                                           width=cfg.length_per_env_pixels,
                                            length=cfg.width_per_env_pixels,
                                            vertical_scale=cfg.vertical_scale,
                                            horizontal_scale=cfg.horizontal_scale)
@@ -134,7 +136,7 @@ class Terrain:
             (i, j) = np.unravel_index(k, (cfg.num_rows, cfg.num_cols))
 
             terrain = terrain_utils.SubTerrain("terrain",
-                                               width=cfg.width_per_env_pixels,
+                                               width=cfg.length_per_env_pixels,
                                                length=cfg.width_per_env_pixels,
                                                vertical_scale=cfg.vertical_scale,
                                                horizontal_scale=cfg.horizontal_scale)
@@ -144,7 +146,7 @@ class Terrain:
 
     def make_terrain(self, cfg, choice, difficulty, proportions):
         terrain = terrain_utils.SubTerrain("terrain",
-                                           width=cfg.width_per_env_pixels,
+                                           width=cfg.length_per_env_pixels,
                                            length=cfg.width_per_env_pixels,
                                            vertical_scale=cfg.vertical_scale,
                                            horizontal_scale=cfg.horizontal_scale)

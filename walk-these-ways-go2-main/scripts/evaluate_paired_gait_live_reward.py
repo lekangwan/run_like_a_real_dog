@@ -243,9 +243,15 @@ def finalize_metric_tensors(stats):
     return output
 
 
-def run_fixed_gait(env, gait_name, vx, steps, warmup_steps):
+def run_fixed_gait(env, gait_name, vx, steps, warmup_steps, gamma, time_bin_steps=0):
     action = fixed_action(env, gait_name)
     stats = init_metric_tensors(env)
+    bin_stats = init_metric_tensors(env) if time_bin_steps > 0 else None
+    bin_outputs = []
+    bin_start_step = 0
+    ppo_option_return = torch.zeros(env.num_envs, device=env.device)
+    ppo_active_steps = torch.zeros(env.num_envs, device=env.device)
+    ppo_active = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
     # Use no_grad instead of inference_mode because this script snapshots and
     # restores simulator tensors. Inference tensors reject later inplace restore.
     with torch.no_grad():
@@ -254,8 +260,33 @@ def run_fixed_gait(env, gait_name, vx, steps, warmup_steps):
             _obs, reward, done, info = env.step(action)
             set_fixed_vx(env, vx)
             if step >= warmup_steps:
+                eval_step = step - warmup_steps
+                active_float = ppo_active.to(dtype=reward.dtype)
+                # Match train_high_level_oracle_ppo.py exactly: include the
+                # terminal step, discount physical steps, then stop accumulating
+                # this option after the first reset.
+                ppo_option_return += (gamma ** eval_step) * reward * active_float
+                ppo_active_steps += active_float
+                ppo_active &= ~done.bool()
                 collect_step_stats(stats, env, reward, done, info)
-    return finalize_metric_tensors(stats)
+                if bin_stats is not None:
+                    collect_step_stats(bin_stats, env, reward, done, info)
+                    bin_complete = (eval_step + 1) % time_bin_steps == 0
+                    eval_complete = eval_step + 1 == steps
+                    if bin_complete or eval_complete:
+                        bin_outputs.append(
+                            {
+                                "start_step": bin_start_step,
+                                "end_step": eval_step + 1,
+                                "metrics": finalize_metric_tensors(bin_stats),
+                            }
+                        )
+                        bin_start_step = eval_step + 1
+                        bin_stats = init_metric_tensors(env)
+    output = finalize_metric_tensors(stats)
+    output["ppo_option_return"] = ppo_option_return
+    output["ppo_active_steps"] = ppo_active_steps
+    return output, bin_outputs
 
 
 def context_rollout(env, gait_name, vx, steps):
@@ -313,6 +344,25 @@ def summarize_deltas(rows, gait_a, gait_b):
                 "delta_positive_rate": float((delta > 0.0).float().mean().item()),
             }
         )
+    return out
+
+
+def summarize_time_bin_deltas(rows, gait_a, gait_b):
+    grouped = {}
+    for row in rows:
+        key = (int(row["start_step"]), int(row["end_step"]))
+        grouped.setdefault(key, []).append(row)
+
+    out = []
+    for (start_step, end_step), bin_rows in sorted(grouped.items()):
+        for summary in summarize_deltas(bin_rows, gait_a, gait_b):
+            out.append(
+                {
+                    "start_step": start_step,
+                    "end_step": end_step,
+                    **summary,
+                }
+            )
     return out
 
 
@@ -379,7 +429,31 @@ def main():
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--warmup-steps", type=int, default=50)
+    parser.add_argument(
+        "--time-bin-steps",
+        type=int,
+        default=0,
+        help="Also write paired metric summaries for consecutive step bins; 0 disables it.",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.99,
+        help="Per-physical-step discount used for the PPO-matched option return.",
+    )
     parser.add_argument("--terrain-size", type=float, default=TRAIN_TERRAIN_SIZE)
+    parser.add_argument(
+        "--terrain-length",
+        type=float,
+        default=None,
+        help="Forward terrain length in metres; defaults to --terrain-size.",
+    )
+    parser.add_argument(
+        "--terrain-width",
+        type=float,
+        default=None,
+        help="Lateral terrain width in metres; defaults to --terrain-size.",
+    )
     parser.add_argument("--edge-reset-margin", type=float, default=TRAIN_EDGE_RESET_MARGIN)
     parser.add_argument("--teleport-thresh", type=float, default=TRAIN_TELEPORT_THRESH)
     parser.add_argument("--mesh-type", default=TRAIN_MESH_TYPE, choices=["heightfield", "trimesh"])
@@ -426,9 +500,12 @@ def main():
         teleport_thresh=args.teleport_thresh,
         mesh_type=args.mesh_type,
         selector_hold_steps=args.selector_hold_steps,
+        terrain_length=args.terrain_length,
+        terrain_width=args.terrain_width,
     )
 
     rows = []
+    time_bin_rows = []
     try:
         for repeat in range(args.repeats):
             env.reset()
@@ -437,9 +514,25 @@ def main():
             state = snapshot_env(env)
 
             restore_env(env, state)
-            result_a = run_fixed_gait(env, args.gait_a, vx, args.steps, args.warmup_steps)
+            result_a, bins_a = run_fixed_gait(
+                env,
+                args.gait_a,
+                vx,
+                args.steps,
+                args.warmup_steps,
+                args.gamma,
+                args.time_bin_steps,
+            )
             restore_env(env, state)
-            result_b = run_fixed_gait(env, args.gait_b, vx, args.steps, args.warmup_steps)
+            result_b, bins_b = run_fixed_gait(
+                env,
+                args.gait_b,
+                vx,
+                args.steps,
+                args.warmup_steps,
+                args.gamma,
+                args.time_bin_steps,
+            )
 
             metric_names = sorted(set(result_a) | set(result_b))
             for env_id in range(args.num_envs):
@@ -460,6 +553,39 @@ def main():
                     if metric in result_b:
                         row[f"{metric}_{args.gait_b}"] = tensor_to_float(result_b[metric], env_id)
                 rows.append(row)
+            if len(bins_a) != len(bins_b):
+                raise RuntimeError("Paired gait runs produced different time-bin counts")
+            for bin_a, bin_b in zip(bins_a, bins_b):
+                if (bin_a["start_step"], bin_a["end_step"]) != (
+                    bin_b["start_step"],
+                    bin_b["end_step"],
+                ):
+                    raise RuntimeError("Paired gait runs produced mismatched time bins")
+                bin_metric_names = sorted(set(bin_a["metrics"]) | set(bin_b["metrics"]))
+                for env_id in range(args.num_envs):
+                    bin_row = {
+                        "repeat": repeat,
+                        "env_id": env_id,
+                        "task_id": spec.task_id,
+                        "condition": spec.condition,
+                        "cmd_vx": vx,
+                        "gait_a": args.gait_a,
+                        "gait_b": args.gait_b,
+                        "context_gait": args.context_gait,
+                        "context_steps": args.context_steps,
+                        "start_step": bin_a["start_step"],
+                        "end_step": bin_a["end_step"],
+                    }
+                    for metric in bin_metric_names:
+                        if metric in bin_a["metrics"]:
+                            bin_row[f"{metric}_{args.gait_a}"] = tensor_to_float(
+                                bin_a["metrics"][metric], env_id
+                            )
+                        if metric in bin_b["metrics"]:
+                            bin_row[f"{metric}_{args.gait_b}"] = tensor_to_float(
+                                bin_b["metrics"][metric], env_id
+                            )
+                    time_bin_rows.append(bin_row)
             print(
                 f"repeat={repeat} task={spec.task_id} vx={vx:.2f} "
                 f"{args.gait_a} reward={result_a['weighted_metric_reward'].mean().item():.4f} "
@@ -480,6 +606,16 @@ def main():
     print(f"Wrote: {env_csv}")
     print(f"Wrote: {delta_csv}")
     print(f"Wrote: {summary_path}")
+    if time_bin_rows:
+        time_bin_csv = output_dir / "paired_time_bin_metrics.csv"
+        time_bin_delta_csv = output_dir / "paired_time_bin_deltas.csv"
+        write_csv(time_bin_csv, time_bin_rows)
+        write_csv(
+            time_bin_delta_csv,
+            summarize_time_bin_deltas(time_bin_rows, args.gait_a, args.gait_b),
+        )
+        print(f"Wrote: {time_bin_csv}")
+        print(f"Wrote: {time_bin_delta_csv}")
 
 
 if __name__ == "__main__":

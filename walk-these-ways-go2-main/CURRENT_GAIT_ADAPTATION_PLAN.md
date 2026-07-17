@@ -10794,3 +10794,2019 @@ Reason:
   removes random initial gait preference so the next flat-only test can check
   whether pronking still wins from an unbiased start.
 ```
+
+Zero-initialized flat-only result:
+
+```text
+Run:
+  runs/high_level_oracle_gait/20260710_v4_flat_only_decision_interval50_phys800_zeroinit_selector_iter050
+
+Training:
+  first 5 iterations:
+    reward = 0.8296
+    vx_err = 0.1809
+    pronking = 0.318
+    trotting = 0.296
+    bound = 0.202
+    pace = 0.184
+
+  iterations 5-9:
+    reward = 0.8381
+    vx_err = 0.1778
+    pronking = 0.503
+    trotting = 0.314
+
+  iterations 20-29:
+    reward = 0.8440
+    vx_err = 0.1820
+    pronking = 0.917
+    trotting = 0.077
+
+  last 10 iterations:
+    reward = 0.8436
+    vx_err = 0.1836
+    pronking = 0.996
+    trotting = 0.004
+
+  final iteration:
+    pronking = 0.997
+    trotting = 0.003
+```
+
+Per-gait training signal:
+
+```text
+First 5 iterations:
+  pronking: count 1628, adv +0.0697, reward 20.852
+  trotting: count 1518, adv +0.0163, reward 20.377
+
+Iterations 5-9:
+  pronking: count 2574, adv +0.0181, reward 20.355
+  trotting: count 1608, adv +0.0128, reward 20.339
+
+Iterations 20-29:
+  pronking: count 9387, adv +0.0056, reward 20.673
+  trotting: count 784,  adv -0.0520, reward 20.976
+
+Last 10 iterations:
+  pronking: count 10200, adv -0.0001, reward 20.724
+  trotting: count 37,    adv +0.0279, reward 22.806
+```
+
+Updated interpretation:
+
+```text
+Zero-initializing the selector head did not prevent flat-only collapse to
+pronking. Therefore the issue is not just random initial gait-logit bias.
+
+The early training signal under the online mixed-switching state distribution
+actually favors pronking: in the first 5 iterations, pronking has higher sampled
+reward and higher sampled advantage than trotting.
+
+This does not contradict the fixed-gait flat audit. The two experiments compare
+different situations:
+  - fixed-gait audit: force one gait for the whole rollout from reset;
+  - PPO training: sample many gait switches early, then evaluate each 50-step
+    decision from states produced by previous mixed gait choices.
+
+The current evidence suggests that pronking is rewarded as a robust response in
+early mixed/switching states, and this early advantage is amplified into a
+stable all-pronking policy. Once trotting becomes rarely sampled, it has little
+chance to recover even if pure fixed trotting would be better on flat.
+```
+
+Next diagnostic:
+
+```text
+Do not change the reward yet.
+
+The next question is whether the early pronking advantage is caused by the
+high-switching exploration distribution. Test a staged version:
+  1. keep decision_interval=50;
+  2. keep selector head zero-initialized;
+  3. add a temporary gait-switch penalty during the early diagnostic run;
+  4. or force longer initial dwell / lower switching without using gait labels.
+
+If reducing early switching lets flat-only training converge to trotting, then
+the issue is switching-state contamination rather than flat reward preference.
+If it still converges to pronking, then long-window flat PPO has a deeper
+pronking preference that must be diagnosed through same-state pair tests sampled
+from the training state distribution.
+```
+
+### Flat-only decision interval 100 result (2026-07-11)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260710_v4_flat_only_decision_interval100_phys800_zeroinit_selector_iter050
+```
+
+The run completed all 50 iterations and produced checkpoint
+`high_level_000049.pt`. Independent evaluation used four fixed flat speeds and
+1000 steps per speed:
+
+```text
+vx=0.5: pronking 1.000, reward 0.9152, vx_err 0.0607
+vx=1.0: pronking 1.000, reward 0.8664, vx_err 0.1342
+vx=1.5: pronking 1.000, reward 0.7914, vx_err 0.2762
+vx=2.0: pronking 1.000, reward 0.6966, vx_err 0.4841
+
+mean reward = 0.8174
+mean vx_err = 0.2388
+gait switches = 0
+```
+
+Updated conclusion:
+
+```text
+Increasing the decision execution interval from 50 to 100 does not correct the
+flat-only policy. The learned selector still chooses pronking exclusively at
+every tested speed and holds it for the full evaluation.
+
+Therefore the flat pronking attractor is not explained solely by a 50-step
+decision being too short or by frequent gait switching during final execution.
+The learned policy remains close to the fixed-pronking baseline and below the
+fixed-trotting flat audit, so this is still a suboptimal training outcome under
+the same v4 physical reward.
+
+The next diagnostic should compare trotting and pronking from identical states
+sampled from the early online training distribution. This directly tests why
+early PPO rollouts favor pronking even though full-rollout fixed-gait evaluation
+from reset favors trotting. Further ordinary flat PPO runs or still longer dwell
+times are not justified before this state-distribution mismatch is measured.
+```
+
+### Flat paired audit from a pronking context (2026-07-11)
+
+Protocol:
+
+```text
+task = flat_trot_efficiency
+vx = 1.0
+shared context = 100 pronking steps
+paired alternatives = continue pronking vs switch to trotting
+comparison horizon = 100 steps, no discarded warmup
+samples = 10 repeats x 32 environments
+```
+
+Result (`pronking - trotting`):
+
+```text
+reward delta mean   = -0.00742
+reward delta median = -0.00683
+reward delta std    =  0.01559
+P(pronking > trot)  =  0.334
+
+pronking vx_err = 0.1435
+trotting vx_err = 0.1287
+
+pronking mechanical power = 160.63
+trotting mechanical power = 133.78
+```
+
+Interpretation:
+
+```text
+The flat pronking collapse is not explained by pronking becoming locally better
+once the robot is already in a pronking-generated state. Even after a shared
+100-step pronking context, switching to trotting gives higher mean and median
+reward, wins about two thirds of paired samples, tracks forward speed better,
+and uses less mechanical power.
+
+Pronking is better on yaw tracking, contact-normalized slip, impact, and
+scuffing, but those advantages do not overcome trotting in the final v4 reward.
+Therefore the observed all-pronking PPO solution is increasingly inconsistent
+with the true 100-step action return measured by the paired simulator audit.
+
+One reverse-context test is still required: establish a shared trotting state
+and compare continuing trotting against switching to pronking. If trotting also
+wins there, state hysteresis is ruled out and the investigation should move to
+the PPO decision-transition, return/advantage estimation, and selector update
+pipeline rather than reward design or gait execution duration.
+```
+
+### Flat paired audit from a trotting context (2026-07-11)
+
+Result (`pronking - trotting`) after a shared 100-step trotting context:
+
+```text
+reward delta mean   = -0.00917
+reward delta median = -0.00859
+reward delta std    =  0.01493
+P(pronking > trot)  =  0.272
+
+pronking vx_err = 0.1416
+trotting vx_err = 0.1238
+
+pronking mechanical power = 159.89
+trotting mechanical power = 131.33
+```
+
+Combined interpretation of both context directions:
+
+```text
+Trotting wins the 100-step mean-reward comparison from both a pronking context
+and a trotting context. State hysteresis therefore does not explain why the
+flat-only PPO selector converges to pronking.
+
+However, code inspection found that the paired audit and PPO were still using
+different return definitions. The paired audit averaged all 100 rewards and
+continued counting after automatic resets. PPO discounts each physical reward
+and stops accumulating an option after that environment's first reset. With a
+per-step flat reset rate near 1.8%, most 100-step options encounter at least one
+reset, so this mismatch is material.
+
+The paired evaluator now also records `ppo_option_return` and
+`ppo_active_steps`, exactly matching the training option-reward accumulation.
+The next run must use these fields before attributing the collapse to PPO's
+advantage estimator or selector update.
+```
+
+### PPO-matched paired return from a pronking context (2026-07-11)
+
+The updated paired evaluator exposed a reversal between the two return
+definitions:
+
+```text
+Undiscounted 100-step mean reward:
+  pronking = 0.8612
+  trotting = 0.8676
+  pronking - trotting = -0.00642
+  P(pronking > trotting) = 0.344
+
+PPO-matched discounted return, stopped at first reset:
+  pronking = 13.3258
+  trotting = 12.7409
+  pronking - trotting = +0.58497
+  P(pronking > trotting) = 0.8375
+
+Steps accumulated before first reset:
+  pronking = 16.7188
+  trotting = 16.0469
+  delta = +0.6719 steps
+```
+
+Interpretation:
+
+```text
+The PPO selector is not contradicting the signal it actually receives. Under
+the training return definition, pronking really is favored, despite having a
+lower physical reward per step. A small difference in time to the first reset
+dominates the option return because the 100-step decision is usually truncated
+very early.
+
+This exposes an interaction between long high-level decisions and the finite
+12 m terrain. At vx=1.0, a sustained option can reach an artificial terrain-edge
+reset long before its nominal 100-step horizon. The selector is then trained to
+maximize time until this simulator boundary reset, not simply the intended v4
+physical objective. This can create the observed flat pronking attractor.
+
+Before changing PPO or reward weights, repeat the paired test from reset on a
+substantially larger flat terrain. If the PPO-matched return then favors
+trotting, artificial edge truncation is the identified cause. The subsequent
+training fix must prevent edge resets from cutting most high-level decisions,
+for example with a sufficiently long terrain or a nonterminal recentering
+mechanism.
+```
+
+### Large-terrain paired confirmation (2026-07-11)
+
+The 60 m square trimesh crashed during environment creation because increasing
+the scalar terrain size enlarged both forward length and lateral width. A 30 m
+square test completed successfully and nearly eliminated resets:
+
+```text
+terrain = 30 m x 30 m
+context = reset state
+evaluation horizon = 100 steps
+
+PPO active steps:
+  pronking = 99.70
+  trotting = 100.00
+
+PPO-matched option return:
+  pronking = 55.4185
+  trotting = 56.1129
+  pronking - trotting = -0.6944
+  P(pronking > trotting) = 0.175
+
+100-step mean reward:
+  pronking = 0.8888
+  trotting = 0.8962
+  pronking - trotting = -0.00743
+```
+
+Conclusion:
+
+```text
+When artificial edge truncation is removed, both the ordinary physical reward
+and the exact PPO option return favor trotting. This confirms that the flat
+all-pronking solution was driven primarily by the interaction between long
+decision windows and the short 12 m terrain, not by the intended v4 physical
+reward.
+```
+
+Implementation update:
+
+```text
+The environment now supports independent `terrain_length` and `terrain_width`
+arguments. This allows a long, narrow terrain such as 60 m x 12 m. Its mesh area
+is smaller than the successful 30 m x 30 m test while providing substantially
+more forward travel before an edge reset. Existing commands that only specify
+`terrain_size` retain their previous square-terrain behavior.
+```
+
+Rectangular-terrain implementation fix (2026-07-11):
+
+```text
+The first 60 m x 12 m run failed before simulation because terrain.py had a
+square-only assumption: it swapped length/width pixel counts and constructed
+each SubTerrain with the same dimension for both axes. Square terrains hid this
+bug. The height-field mapping and all SubTerrain constructors now use forward
+terrain length for x rows and lateral terrain width for y columns. Python syntax
+checks pass, and square-terrain dimensions remain unchanged.
+```
+
+### Long-narrow terrain result and artificial-reset fix (2026-07-11)
+
+The corrected 60 m x 12 m terrain ran successfully, but its narrow lateral
+boundary still truncated many options:
+
+```text
+PPO active steps:
+  pronking = 74.63
+  trotting = 72.57
+
+100-step mean reward:
+  pronking = 0.8728
+  trotting = 0.8811
+  pronking - trotting = -0.00829
+
+PPO-matched truncated return:
+  pronking = 44.8285
+  trotting = 44.3848
+  pronking - trotting = +0.4438
+```
+
+Interpretation and implementation:
+
+```text
+Forward length alone is insufficient because finite lateral boundaries and
+simulation time limits can still terminate a long option. The intended physical
+reward favors trotting, while the truncated training return again weakly favors
+pronking because pronking remains active about two steps longer.
+
+The high-level wrapper now reports terrain-edge resets, time-limit resets, and
+physical failures separately. Training adds an explicit
+`continue_option_after_artificial_reset` mode: edge and time-limit resets no
+longer stop reward accumulation or mark the high-level transition terminal, but
+true physical failures still do. This removes finite simulator geometry from
+the gait-selection objective without adding task ids, gait labels, or gait
+priors. The old behavior remains the default for controlled comparison.
+```
+
+Artificial-reset continuation smoke test:
+
+```text
+Run:
+  runs/high_level_oracle_gait/20260711_v4_flat_k100_continue_artificial_reset_smoke_iter005
+
+iteration 0:
+  reward = 0.8203
+  vx_err = 0.1898
+  pronking = 0.246
+  trotting = 0.232
+
+iteration 4:
+  reward = 0.8441
+  vx_err = 0.1712
+  pronking = 0.336
+  trotting = 0.523
+
+sampled/executed gait mismatch = 0 throughout
+```
+
+Interpretation:
+
+```text
+The new continuation path is stable. Unlike the old flat K=100 run, the early
+selector update now moves toward trotting rather than immediately amplifying
+pronking. Five iterations are insufficient for a convergence claim, but this is
+the expected directional response after removing artificial-reset truncation.
+
+The survival metric was also cleaned up so time-limit resets are no longer
+classified as physical falls. Edge resets, time limits, and real failures are
+now treated consistently in both option termination and reward semantics.
+```
+
+### Flat-only 50-iteration artificial-reset continuation result (2026-07-11)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260711_v4_flat_k100_continue_artificial_reset_iter050
+```
+
+Training summary:
+
+```text
+First 5 iterations:
+  reward = 0.8349
+  vx_err = 0.1789
+  trotting = 0.393
+  pronking = 0.325
+
+Iterations 5-9:
+  reward = 0.8477
+  vx_err = 0.1693
+  trotting = 0.595
+  pronking = 0.365
+
+Iterations 20-29:
+  reward = 0.8562
+  vx_err = 0.1541
+  trotting = 0.9965
+  pronking = 0.0035
+
+Last 10 iterations:
+  reward = 0.8562
+  vx_err = 0.1537
+  trotting = 0.9994
+  pronking = 0.0006
+
+Final iteration:
+  trotting = 1.000
+  pronking = 0.000
+  gait switches = 0
+```
+
+Early sampled training signal:
+
+```text
+First 5 iterations:
+  trotting: option reward 53.850, advantage +0.1234
+  pronking: option reward 53.339, advantage +0.1059
+
+Iterations 5-9:
+  trotting: option reward 54.147, advantage +0.0484
+  pronking: option reward 53.350, advantage -0.0338
+```
+
+Conclusion:
+
+```text
+Removing artificial edge/time-limit truncation makes PPO's online credit agree
+with the fixed-gait and large-terrain paired audits. Flat-only training now
+converges cleanly to trotting instead of the previously observed suboptimal
+all-pronking attractor. This identifies artificial reset truncation, rather than
+reward weights, selector capacity, initial logits, or gait-state hysteresis, as
+the main cause of the flat K=100 collapse.
+
+The next check is independent fixed-speed evaluation of checkpoint 49. After
+that, the same corrected option semantics should be tested on ramp-only before
+returning to mixed-terrain training.
+```
+
+Independent fixed-speed confirmation:
+
+```text
+vx=0.5: trotting 1.000, reward 0.9158, vx_err 0.0631
+vx=1.0: trotting 1.000, reward 0.8727, vx_err 0.1218
+vx=1.5: trotting 1.000, reward 0.8110, vx_err 0.2178
+vx=2.0: trotting 1.000, reward 0.7351, vx_err 0.3911
+
+mean reward = 0.8337
+mean vx_err = 0.1984
+gait switches = 0
+```
+
+Comparison with the pre-fix flat K=100 all-pronking model:
+
+```text
+mean reward: 0.8174 -> 0.8337
+mean vx_err: 0.2388 -> 0.1984
+```
+
+This independently confirms that correcting artificial-reset credit assignment
+both recovers the fixed-audit-preferred gait and improves actual locomotion
+performance. The next controlled experiment is ramp-only training with the same
+corrected option semantics.
+
+### Ramp-only 50-iteration corrected-option result (2026-07-12)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260711_v4_ramp_k100_continue_artificial_reset_iter050
+```
+
+Training summary:
+
+```text
+First 5 iterations:
+  reward = 0.8117
+  vx_err = 0.2108
+  pronking = 0.372
+  trotting = 0.330
+
+Iterations 5-9:
+  reward = 0.8243
+  vx_err = 0.2018
+  pronking = 0.604
+  trotting = 0.341
+
+Iterations 20-29:
+  reward = 0.8310
+  vx_err = 0.1955
+  pronking = 0.866
+  trotting = 0.132
+
+Last 10 iterations:
+  reward = 0.8328
+  vx_err = 0.1936
+  pronking = 0.972
+  trotting = 0.028
+
+Final iteration:
+  reward = 0.8350
+  vx_err = 0.1889
+  pronking = 0.9785
+  trotting = 0.0215
+```
+
+Early sampled training signal:
+
+```text
+First 5 iterations:
+  pronking: option reward 51.759, advantage +0.1363
+  trotting: option reward 51.299, advantage +0.0478
+
+Iterations 5-9:
+  pronking: option reward 52.067, advantage +0.0305
+  trotting: option reward 51.538, advantage +0.0058
+```
+
+Conclusion:
+
+```text
+With identical reward, architecture, zero initialization, and corrected option
+semantics, flat-only converges to trotting while ramp-only converges strongly to
+pronking. No task id or gait target is supplied to the selector. This is the
+first clean evidence that the unified physical reward can produce different
+learned gait choices from different physical training distributions once
+artificial reset truncation is removed.
+
+The next step is independent evaluation at fixed ramp speeds. Only after that
+should flat and ramp be mixed to test whether the selector can condition its
+choice on physical information rather than collapse to one global gait.
+```
+
+Independent fixed-speed ramp confirmation:
+
+```text
+vx=0.5: pronking 1.000, reward 0.9026, vx_err 0.0783
+vx=1.0: pronking 1.000, reward 0.8588, vx_err 0.1369
+vx=1.5: pronking 1.000, reward 0.7788, vx_err 0.2867
+vx=2.0: pronking 1.000, reward 0.6752, vx_err 0.5249
+
+mean reward = 0.8038
+mean vx_err = 0.2567
+gait switches = 0
+```
+
+The `target=trotting` text in the evaluator table is a legacy task-map label.
+It supplied no selector reward because style reward and selector-target training
+were both disabled. The learned all-pronking result is therefore reward-driven,
+not label-driven.
+
+The flat and ramp single-task controls are now complete. The next decisive test
+is one from-scratch flat+ramp policy with no task id and corrected artificial-
+reset handling. Success requires condition-dependent selection in one network,
+not merely reproducing each single-task optimum in separate policies.
+
+### Flat+ramp mixed training result (2026-07-12)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260712_v4_flat_ramp_k100_continue_artificial_reset_iter050
+```
+
+Task-conditioned training ratios:
+
+```text
+First 5 iterations:
+  flat: pronking 0.366, trotting 0.295
+  ramp: pronking 0.362, trotting 0.284
+
+Iterations 20-29:
+  flat: pronking 0.779, trotting 0.219
+  ramp: pronking 0.798, trotting 0.200
+
+Last 10 iterations:
+  flat: pronking 0.786, trotting 0.206
+  ramp: pronking 0.917, trotting 0.082
+
+Final iteration:
+  flat: pronking 0.668, trotting 0.328
+  ramp: pronking 0.914, trotting 0.086
+```
+
+Interpretation:
+
+```text
+The mixed policy is not completely condition-blind: late training shows a
+larger trotting probability on flat than on ramp. However, it does not reproduce
+the clean single-task optima. Ramp's pronking preference dominates the shared
+optimization and flat remains pronking-majority.
+
+This is partial condition sensitivity, not successful gait separation. Before
+changing architecture, sampling, or training length, checkpoint 49 must be
+evaluated independently at fixed speeds for both tasks. That will show whether
+the late per-task difference is stable and speed-dependent or merely rollout
+sampling noise.
+```
+
+Independent mixed-policy evaluation:
+
+```text
+Flat:
+  vx=0.5: pronking 0.965, trotting 0.031, reward 0.9114
+  vx=1.0: pronking 0.928, trotting 0.062, reward 0.8548
+  vx=1.5: pronking 0.896, trotting 0.086, reward 0.7713
+  vx=2.0: pronking 0.885, trotting 0.089, reward 0.6668
+  mean reward = 0.8011
+
+Ramp:
+  vx=0.5: pronking 1.000, reward 0.9029
+  vx=1.0: pronking 0.999, reward 0.8580
+  vx=1.5: pronking 0.998, reward 0.7811
+  vx=2.0: pronking 0.994, reward 0.6697
+  mean reward = 0.8029
+```
+
+Compared with the single-task controls:
+
+```text
+flat mean reward: 0.8337 single-task -> 0.8011 mixed
+ramp mean reward: 0.8038 single-task -> 0.8029 mixed
+```
+
+Conclusion and new diagnostic:
+
+```text
+The mixed model preserves the ramp solution but sacrifices the flat solution.
+Its small flat/ramp probability difference is real but insufficient; this is
+not successful conditional gait separation.
+
+The training log previously grouped advantages only by gait across both tasks.
+It now records every task x gait combination separately, including sample count,
+option reward, normalized advantage, and positive-advantage rate. A short
+from-scratch mixed run will determine whether flat-trotting has the correct
+local online signal but is overwhelmed by shared optimization, or whether the
+mixed rollout distribution changes the flat signal itself.
+```
+
+### Task x gait training-signal diagnosis (2026-07-12)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260712_v4_flat_ramp_k100_task_gait_signal_diag_iter010
+```
+
+Observed 100-step option rewards:
+
+```text
+First 5 iterations:
+  flat: trotting 53.972 > pronking 53.290
+  ramp: pronking 51.797 > trotting 51.257
+
+Last 5 iterations:
+  flat: trotting 54.115 > pronking 53.470
+  ramp: pronking 51.715 > trotting 51.272
+```
+
+The environment reward therefore supplies the correct task-local ordering in
+both halves of training. However, the critic/GAE advantages do not preserve it:
+
+```text
+Last 5 iterations:
+  flat advantage: pronking +0.207 > trotting +0.159
+  ramp advantage: trotting -0.135 > pronking -0.168
+```
+
+Interpretation and next diagnostic:
+
+```text
+The mixed rollout does not reverse the physical reward itself. The reversal is
+introduced by value estimation and multi-decision advantage calculation. Value
+loss is orders of magnitude larger than the approximately 0.5 option-reward
+margin between gaits, so critic error can dominate the selector update.
+
+A diagnostic selector-only mode now updates gait logits from normalized observed
+100-step option reward while continuing to train the critic normally. It uses no
+task id, gait label, audit winner, or per-terrain reward. Because each option
+already executes one gait for 100 physical high-level steps, this directly tests
+whether removing critic noise recovers conditional selection. It is initially a
+diagnostic, not yet the final algorithm, because it intentionally ignores value
+beyond the current 100-step option.
+```
+
+### Direct option-reward diagnostic result (2026-07-12)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260712_v4_flat_ramp_k100_direct_option_reward_diag_iter010
+```
+
+Last-five-iteration gait ratios:
+
+```text
+flat: pronking 0.327, trotting 0.662
+ramp: pronking 0.350, trotting 0.635
+```
+
+The selector moved both tasks toward trotting rather than separating them. The
+reason is visible in the absolute option rewards:
+
+```text
+flat options are typically around 53-55
+ramp options are typically around 50-52
+```
+
+Global reward normalization therefore makes most flat samples positive and most
+ramp samples negative, even when ramp-pronking is better than ramp-trotting. In
+expectation an action-independent baseline should not bias the policy gradient,
+but with finite samples and a shared selector this large task-difficulty offset
+creates excessive variance and a common update direction.
+
+Next implementation:
+
+```text
+A per-environment leave-one-out reward baseline is available. Each option is
+compared with the other seven options collected from the same parallel
+environment, then all centered differences are standardized. Every environment
+keeps one physical condition, so this removes its difficulty offset without
+reading task ids or supplying gait information. Leave-one-out keeps the baseline
+independent of the current sampled gait action.
+```
+
+### Per-environment leave-one-out baseline result (2026-07-12)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260712_v4_flat_ramp_k100_per_env_reward_baseline_diag_iter010
+```
+
+Last-five-iteration result:
+
+```text
+Gait ratios:
+  flat: pronking 0.314, trotting 0.661
+  ramp: pronking 0.320, trotting 0.658
+
+Task-local policy update signal:
+  flat:
+    trotting reward 54.336, advantage +0.0665
+    pronking reward 53.589, advantage -0.1045
+  ramp:
+    pronking reward 52.376, advantage +0.1415
+    trotting reward 51.389, advantage -0.0493
+```
+
+Interpretation:
+
+```text
+The per-environment baseline successfully preserves both opposing local update
+directions in the same batch: flat pushes toward trotting while ramp pushes
+toward pronking. This fixes the reward-scale conflict without task labels.
+
+After only ten iterations the selector probabilities remain similar across the
+two tasks and are still trotting-majority. Therefore this run does not yet prove
+conditional separation. Unlike the previous extensions, however, longer
+training is now justified because the selector receives the correct opposing
+signals. A 50-iteration from-scratch run is the next test. If it still fails to
+separate, the remaining bottleneck is condition representation or selector
+architecture rather than reward credit direction.
+```
+
+### 50-iteration per-environment baseline result (2026-07-12)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260712_v4_flat_ramp_k100_per_env_reward_baseline_iter050
+```
+
+Task-conditioned progression:
+
+```text
+Iterations 10-19:
+  flat: pronking 0.606, trotting 0.393
+  ramp: pronking 0.621, trotting 0.379
+
+Iterations 30-39:
+  flat: pronking 0.250, trotting 0.747
+  ramp: pronking 0.341, trotting 0.657
+
+Last 10 iterations:
+  flat: pronking 0.091, trotting 0.909
+  ramp: pronking 0.343, trotting 0.656
+
+Final iteration:
+  flat: pronking 0.039, trotting 0.961
+  ramp: pronking 0.375, trotting 0.625
+```
+
+Last-ten task-local training signal:
+
+```text
+flat:
+  trotting reward 54.350, advantage +0.0098
+  pronking reward 54.002, advantage -0.0983
+
+ramp:
+  pronking reward 52.261, advantage +0.0730
+  trotting reward 51.649, advantage -0.0335
+```
+
+Interpretation:
+
+```text
+The corrected baseline produces real conditional separation: flat converges
+strongly toward trotting, while ramp retains a pronking probability roughly four
+to ten times larger than flat. The task-local policy signals remain directionally
+correct in the last-ten average.
+
+Separation is incomplete because ramp is still trotting-majority rather than
+recovering its single-task pronking optimum. This is progress, not final success.
+Independent fixed-speed evaluation is required to determine whether the learned
+difference is stable, speed-conditioned, and physically useful before deciding
+between longer training and a selector-representation change.
+```
+
+Independent mixed-policy evaluation:
+
+```text
+Flat:
+  vx=0.5: trotting 0.995, pronking 0.005
+  vx=1.0: trotting 0.999, pronking 0.001
+  vx=1.5: trotting 0.999, pronking 0.001
+  vx=2.0: trotting 1.000, pronking 0.000
+
+Ramp:
+  vx=0.5: trotting 0.542, pronking 0.458
+  vx=1.0: trotting 0.640, pronking 0.360
+  vx=1.5: trotting 0.732, pronking 0.268
+  vx=2.0: trotting 0.819, pronking 0.181
+```
+
+Evaluation interpretation:
+
+```text
+The mixed policy has solved flat gait selection cleanly and has learned a real
+condition- and speed-dependent ramp response: ramp pronking probability is much
+higher than flat pronking probability and is strongest at low ramp speed.
+However, ramp still switches frequently and remains trotting-majority, so it has
+not yet reached the stable single-task ramp solution.
+
+The appropriate next step is a continuation from checkpoint 49 with the same
+per-environment reward baseline, allowing the ramp preference more optimization
+time. Do not zero-initialize the selector during continuation, because that
+would erase the already learned flat/ramp separation.
+
+### Continued per-environment baseline result (2026-07-13)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260713_v4_flat_ramp_per_env_baseline_continued_iter050
+```
+
+This run was initialized from checkpoint 49 of the previous mixed flat/ramp
+run. Continuous residuals remained disabled, so the change is attributable to
+the gait selector rather than continuous parameter tuning.
+
+Training-window gait ratios:
+
+```text
+First 10 iterations:
+  flat: trotting 0.953, pronking 0.047
+  ramp: trotting 0.589, pronking 0.411
+
+Last 10 iterations:
+  flat: trotting 0.995, pronking 0.005
+  ramp: trotting 0.006, pronking 0.994
+
+Final iteration:
+  flat: trotting 0.969, pronking 0.031
+  ramp: trotting 0.004, pronking 0.996
+```
+
+The corresponding ramp-local signal in the last iteration is not a reliable
+head-to-head comparison because only one trotting sample was collected. The
+important evidence is the progression across the run: ramp changed from a
+mixed selector distribution to almost all pronking while flat remained almost
+all trotting. This is substantially stronger separation than the previous
+50-iteration run.
+
+Interpretation:
+
+```text
+The per-environment reward baseline plus continuation training can preserve
+the flat/ramp distinction without task labels, gait labels in the reward, or
+continuous residuals. This supports the explanation that the earlier mixed
+training result was under-optimized rather than proof that the condition signal
+was unusable.
+
+This is not yet a final result. The ramp policy has nearly stopped exploring
+trotting, so training-log comparisons no longer provide a balanced estimate of
+the two gait outcomes. We must verify the checkpoint on fixed speeds and fresh
+rollouts, checking gait probabilities, physical reward, velocity error, and
+switching rate. Only after that evaluation can we decide whether the selector
+has learned a stable physical preference or has simply become overconfident.
+```
+
+### Independent evaluation of the continued checkpoint (2026-07-13)
+
+Evaluation directory:
+
+```text
+runs/high_level_oracle_gait/20260713_v4_flat_ramp_per_env_baseline_continued_iter050/independent_eval/20260713_flat_ramp_full_iter049
+```
+
+Results on fresh rollouts:
+
+```text
+Flat:
+  vx=0.5: pronking 0.812, trotting 0.188, reward 0.9150
+  vx=1.0: pronking 0.038, trotting 0.962, reward 0.8731
+  vx=1.5: pronking 0.000, trotting 1.000, reward 0.8115
+  vx=2.0: pronking 0.000, trotting 1.000, reward 0.7360
+
+Ramp:
+  vx=0.5: pronking 1.000, trotting 0.000, reward 0.9027
+  vx=1.0: pronking 1.000, trotting 0.000, reward 0.8569
+  vx=1.5: pronking 0.849, trotting 0.151, reward 0.7776
+  vx=2.0: pronking 0.105, trotting 0.895, reward 0.6691
+```
+
+The physical scores remain close to the single-task controls at the same
+speeds. There is no residual action because all continuous residual dimensions
+remain disabled. Therefore the selector has learned a strong speed-dependent
+condition response without a direct task label or gait reward.
+
+The result is encouraging but not yet a final gait claim. The lowest-speed flat
+case still chooses pronking often, even though flat single-task training and
+the fair audit make trotting the stronger baseline there. Also, the ramp gait
+preference is now pronking at low and medium speed and mostly trotting at high
+speed. This may be a legitimate speed-conditioned solution, but it may also
+reflect a narrow reward margin or selector overconfidence. The next check must
+use a fixed mixed-scene playback and inspect actual motion, switching timing,
+velocity tracking, and recovery behavior rather than training ratios alone.
+
+Current conclusion:
+
+```text
+The corrected option-reward baseline and continued selector training can
+produce reproducible condition- and speed-dependent gait choices while
+preserving the physical task score. The remaining question is not whether the
+selector can separate at all, but whether the selected differences are
+physically useful and stable across initial states, especially at low flat speed
+and high ramp speed.
+```
+
+Next validation:
+
+```text
+Run fixed mixed-map playback for checkpoint 49. Inspect flat vx=0.5, flat
+vx=1.0, ramp vx=1.0, and ramp vx=2.0 one scene at a time. Record whether gait
+changes coincide with real changes in slope, velocity tracking, body attitude,
+slip, or recovery, rather than only with time or reset events.
+```
+
+### Visual playback check (2026-07-13)
+
+The selected single-scene playback cases completed normally. The ramp scene at
+1.0 m/s executed the pronking-dominant policy, and the ramp scene at 2.0 m/s
+executed the trotting-dominant policy without an obvious viewer, terrain, or
+simulation initialization problem.
+
+This rules out a simple visualization or scene-layout explanation for the
+observed gait difference. It does not prove that every speed-specific gait is
+uniquely optimal, so the next experiment should test whether the separation
+survives when another realistic terrain is added.
+
+### Three-terrain continuation result (2026-07-13)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260713_v4_flat_ramp_rough_per_env_baseline_iter050
+```
+
+The run was initialized from the validated flat/ramp selector checkpoint. It
+kept the same unified physical reward, no task identifier in the observation,
+per-environment leave-one-out reward baseline, selector-only action space, and
+zero continuous residuals.
+
+Training-window results:
+
+```text
+Last 10 iterations:
+  flat:  trotting 0.982, pronking 0.018
+  ramp:  trotting 0.124, pronking 0.875
+  rough: trotting 0.230, pronking 0.769
+
+All iterations:
+  flat:  trotting 0.988, pronking 0.010
+  ramp:  trotting 0.099, pronking 0.893
+  rough: trotting 0.159, pronking 0.834
+```
+
+The selector therefore did not collapse to a single gait when rough terrain
+was added. It preserved trotting on flat ground and preferred pronking on both
+ramp and rough terrain. Bound and pace remained negligible.
+
+The overall physical score decreased from about 0.844 in the two-terrain
+continuation to about 0.821, while mean velocity error increased from about
+0.175 to about 0.207. This is expected to some degree because rough terrain is
+harder, but it cannot be treated as harmless without task-wise evaluation. The
+next validation must check all three terrains at fixed speeds, including
+reward, velocity error, failure rate, switching rate, and gait probability.
+
+### Three-terrain independent evaluation (2026-07-13)
+
+Evaluation directory:
+
+```text
+runs/high_level_oracle_gait/20260713_v4_flat_ramp_rough_per_env_baseline_iter050/independent_eval/20260713_flat_ramp_rough_full_iter049
+```
+
+Fresh fixed-speed evaluation averages:
+
+```text
+flat:
+  average reward 0.833, average vx error 0.198
+  trotting 0.757, pronking 0.243
+
+ramp:
+  average reward 0.789, average vx error 0.272
+  pronking 0.803, trotting 0.197
+
+rough:
+  average reward 0.734, average vx error 0.340
+  pronking 0.701, trotting 0.299
+```
+
+The condition-dependent gait separation survives independent evaluation. The
+speed trend is also consistent: ramp and rough prefer pronking at low and
+medium speeds, then shift toward trotting at 2.0 m/s. Flat is trotting-dominant
+overall, although it still produces substantial pronking at 0.5 m/s.
+
+The important limitation is performance. Rough has lower reward and larger
+velocity error than flat and ramp, and at high speed its gait switching rate is
+about 0.158. Ramp at 2.0 m/s also degrades relative to the earlier two-terrain
+run. This suggests that adding rough terrain introduces genuine shared-policy
+interference or exposes a harder control regime; the gait ratios alone do not
+show whether the chosen gait is physically adequate.
+
+The next experiment is a rough-only control with the same unified reward,
+selector-only action space, no task identifier, and fixed continuous
+parameters. It will measure the best behavior the current information path can
+learn when rough terrain is not competing with the other two terrains. Do not
+add push or stepping-stone terrains until this control is understood.
+
+### Rough-only control result (2026-07-13)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260713_v4_rough_only_per_env_baseline_iter050
+```
+
+This was a from-scratch rough-only control with the same unified reward,
+selector-only action space, no task identifier, per-environment leave-one-out
+baseline, and zero continuous residuals.
+
+Training result:
+
+```text
+Last 10 iterations:
+  trotting 0.998, pronking 0.002
+  reward 0.774
+  vx error 0.255
+
+Final iteration:
+  trotting 0.998, pronking 0.002
+  reward 0.772
+  vx error 0.258
+```
+
+At the final iteration, the rough task-local observed reward was about 48.81
+for trotting and 43.93 for pronking; the corresponding normalized option
+advantages were positive for trotting and strongly negative for pronking.
+
+This is a decisive control result. Rough terrain does not inherently require
+pronking under the current unified physical objective. In the three-terrain
+mixture, rough became pronking-dominant while its reward and velocity tracking
+were worse. The most likely explanation is cross-terrain interference: the
+shared selector transfers the ramp pronking preference into rough states that
+look similar in proprioceptive history, even though rough-only learning finds
+trotting to be the better solution.
+
+The next step is an independent fixed-speed evaluation of this rough-only
+control. Do not modify the reward or add gait labels yet; first quantify the
+rough-only baseline at the four training speeds.
+
+### Rough-only independent evaluation (2026-07-14)
+
+Evaluation directory:
+
+```text
+runs/high_level_oracle_gait/20260713_v4_rough_only_per_env_baseline_iter050/independent_eval/20260713_rough_only_full_iter049
+```
+
+Results:
+
+```text
+vx=0.5: trotting 1.000, reward 0.884, vx error 0.092
+vx=1.0: trotting 1.000, reward 0.804, vx error 0.193
+vx=1.5: trotting 1.000, reward 0.696, vx error 0.365
+vx=2.0: trotting 1.000, reward 0.582, vx error 0.654
+
+Average: reward 0.741, vx error 0.326, trotting 1.000
+```
+
+The rough-only control is stable across all four speeds and confirms that
+trotting is the current unified-reward solution for this terrain. Compared
+with the rough rows in the three-terrain mixture, it improves average reward
+from about 0.734 to 0.741 and reduces average velocity error from about 0.340
+to 0.326. The improvement is modest, but the gait change is systematic:
+rough-only chooses trotting, while the mixture chooses pronking at low and
+medium speeds.
+
+This isolates the current problem as shared condition representation or
+cross-terrain policy interference, rather than a missing rough-terrain reward
+term. The next diagnostic should measure whether the mixed model's student
+latent and selector logits actually separate ramp from rough. Do not change
+the unified reward or add terrain-specific gait supervision before this
+information-path check.
+
+### Three-terrain information-path probe (2026-07-14)
+
+Probe data:
+
+```text
+runs/high_level_oracle_gait/20260713_v4_flat_ramp_rough_per_env_baseline_iter050/info_path_probe/20260714_three_terrain
+```
+
+Linear-probe test accuracy:
+
+```text
+history -> terrain task: 0.722
+teacher latent -> terrain task: 0.928
+student latent -> terrain task: 0.665
+
+history -> speed: 0.940
+student latent -> speed: 0.382
+```
+
+The history contains useful but overlapping terrain information. The teacher
+latent separates the terrain conditions well, while the student latent keeps
+only part of that separation. This is consistent with the rough/ramp
+interference observed in mixed training.
+
+The selector is not ignoring the latent:
+
+```text
+student latent replaced by zero:
+  mean absolute gait-probability change 0.279
+
+student latent replaced by shuffled latent:
+  mean absolute gait-probability change 0.085
+```
+
+Therefore the current bottleneck is primarily student-latent quality, not a
+dead selector branch. The next controlled experiment increases only the
+history-to-teacher-latent imitation weight from 0.1 to 0.5. It keeps the same
+unified reward, no task identifier, no gait-label reward, fixed continuous
+parameters, and the same three-terrain training distribution. The goal is to
+test whether better condition encoding reduces the incorrect transfer of ramp
+pronking into rough terrain.
+
+### Increased latent imitation coefficient result (2026-07-14)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260714_v4_flat_ramp_rough_adaptcoef050_iter050
+```
+
+The imitation coefficient was increased from 0.1 to 0.5 while all reward,
+observation, selector, and continuous-action settings remained unchanged.
+
+Training result:
+
+```text
+All iterations:
+  flat:  trotting 0.992, pronking 0.006
+  ramp:  pronking 0.879, trotting 0.117
+  rough: pronking 0.827, trotting 0.171
+  reward 0.821
+  vx error 0.206
+
+Last 10 iterations:
+  flat:  trotting 0.999, pronking 0.001
+  ramp:  pronking 0.908, trotting 0.091
+  rough: pronking 0.816, trotting 0.184
+```
+
+The latent mean-squared error decreased to about 0.0007, but the rough gait
+preference and physical performance did not improve relative to the original
+three-terrain mixture. This is an important negative result: matching the
+teacher latent numerically more closely does not guarantee that the student
+latent preserves the condition information needed by the selector.
+
+The next step is to repeat the information-path probe on this checkpoint. We
+need to distinguish between two possibilities: the stronger imitation really
+improved terrain classification but the selector mapping is still wrong, or it
+only reduced latent error without improving useful terrain separation.
+
+### Stronger-imitation information-path result (2026-07-14)
+
+Probe data:
+
+```text
+runs/high_level_oracle_gait/20260714_v4_flat_ramp_rough_adaptcoef050_iter050/info_path_probe/20260714_three_terrain
+```
+
+The stronger imitation coefficient did not solve the condition-information
+problem:
+
+```text
+history -> terrain task:         0.704
+student latent -> terrain task:  0.691
+teacher latent -> terrain task:  0.888
+
+student latent replaced by zero:
+  mean absolute gait-probability change 0.198
+```
+
+Compared with the original three-terrain model, student-latent terrain
+classification improved only from about 0.665 to 0.691. The selector's response
+to zeroing the student latent decreased from about 0.279 to 0.198. Therefore a
+smaller latent mean-squared error is not evidence that the student learned a
+more useful condition representation.
+
+The confusion matrices localize the remaining ambiguity. Flat terrain is
+separated well, while ramp and rough are still frequently confused. The
+teacher latent distinguishes these two conditions much better than the student
+latent, but even the raw ten-step history has only about 0.704 linear-probe
+accuracy. Do not further increase the imitation coefficient yet.
+
+The next low-cost diagnostic reuses the already collected history and derives
+explicit temporal summaries: last value, mean, standard deviation, minimum,
+maximum, total change, and mean step-to-step change for every observation
+channel. If a linear probe on these summaries separates ramp and rough much
+better than the flattened history, the current student network is failing to
+extract temporal statistics that are already observable. If it does not, the
+deployment observation itself needs richer physically measurable contact and
+foot-interaction signals before another mixed-policy training run.
+
+### Temporal-summary probe result (2026-07-14)
+
+The same collected samples were re-analysed without new simulation data:
+
+```text
+flattened history -> terrain task: 0.697
+temporal summaries -> terrain task: 0.841
+teacher latent -> terrain task:     0.890
+```
+
+The temporal-summary confusion matrix shows about 83.6% correct ramp
+classification and 79.4% correct rough classification. This is a large gain
+over the flattened-history linear probe and approaches the teacher latent.
+
+Therefore the deployment observations already contain substantially more
+condition information than the current student latent preserves. The next
+controlled experiment changes only the student-side temporal representation:
+the existing ten-step proprioceptive history is converted into per-channel
+first/last/mean/std/min/max/delta/change/RMS statistics before the adaptation
+MLP. It adds no terrain identifier, gait reference, or privileged deployment
+measurement. Reward, task distribution, selector, and fixed residual settings
+remain unchanged. Success requires improved ramp-versus-rough separation and
+rough behavior closer to its rough-only trotting solution without degrading
+flat or ramp physical performance.
+
+The previous high-level action occupies nine channels in each history step, so
+an additional offline control removed those channels before constructing the
+temporal summaries:
+
+```text
+temporal summaries with previous action:    0.837 terrain accuracy
+temporal summaries without previous action: 0.835 terrain accuracy
+```
+
+Removing the previous action has negligible effect. The temporal-probe gain is
+therefore not explained by directly reading the policy's earlier gait choice;
+it is primarily carried by the time variation of proprioceptive state and
+contact observations.
+
+A five-iteration integration smoke run completed successfully:
+
+```text
+runs/high_level_oracle_gait/20260714_v4_flat_ramp_rough_temporal_summary_smoke_iter005
+```
+
+It remained numerically stable, with reward around 0.818-0.825 and velocity
+error around 0.198-0.213. Its final gait ratios are not an outcome test because
+the five iterations compress the teacher-to-student transition into only a few
+updates. The next valid comparison is a full 50-iteration run initialized from
+the pre-summary checkpoint, giving the student encoder the same adaptation
+schedule as the earlier baseline.
+
+### Temporal-summary mixed-training result (2026-07-14)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260714_v4_flat_ramp_rough_temporal_summary_iter050
+```
+
+The 50-iteration run completed without numerical failure. Last-ten-iteration
+comparison against the stronger-imitation baseline:
+
+```text
+                          stronger imitation   temporal summary
+reward                           0.8214             0.8210
+velocity error                   0.2050             0.2054
+flat trotting                    0.9989             0.9784
+ramp pronking                    0.9083             0.7988
+rough trotting                   0.1839             0.3250
+gait switching                   0.0748             0.1634
+```
+
+The temporal representation moves rough terrain toward the rough-only
+trotting solution, but it also weakens ramp pronking and approximately doubles
+the switching rate. Physical reward and velocity tracking are unchanged. The
+effect develops gradually rather than appearing as a single failure when the
+student latent takes over, and the final iteration is unusually variable.
+
+This is not yet evidence that condition separation improved. The required next
+step is an independent fixed-speed evaluation of checkpoint 49 across flat,
+ramp, and rough. Only after that evaluation should the information-path probe
+be repeated or the temporal encoder changed again.
+
+### Temporal-summary independent evaluation (2026-07-15)
+
+Evaluation:
+
+```text
+runs/high_level_oracle_gait/20260714_v4_flat_ramp_rough_temporal_summary_iter050/independent_eval/20260714_three_terrain_full_iter049
+```
+
+Compared with the original three-terrain model at the same fixed speeds:
+
+```text
+flat:
+  reward       0.8330 -> 0.8324
+  vx error     0.1983 -> 0.1986
+  switch rate  0.0012 -> 0.0136
+
+ramp:
+  reward       0.7886 -> 0.7596
+  vx error     0.2717 -> 0.2936
+  switch rate  0.0823 -> 0.2402
+  pronking     0.8030 -> 0.6564
+
+rough:
+  reward       0.7344 -> 0.7262
+  vx error     0.3400 -> 0.3421
+  switch rate  0.0721 -> 0.1510
+  trotting     0.2988 -> 0.4115
+```
+
+The deterministic temporal summaries are rejected as the current policy
+representation. They move rough toward trotting only at some medium/high
+speeds, but provide no physical-performance gain, substantially damage ramp,
+and increase gait chattering. This shows that offline terrain-classification
+accuracy alone is not a sufficient representation objective.
+
+One final information-path collection is required for this checkpoint. It will
+determine whether the student latent actually became more terrain-separable
+while control degraded, or whether the probe improvement did not transfer into
+the trained latent. Do not extend this run or add continuous residuals.
+
+### Evaluation-protocol correction (2026-07-15)
+
+The independent evaluator was found to resample a high-level gait every
+environment step, while these policies were trained with
+`decision_interval=100`, meaning one sampled gait was executed for 100
+environment steps. The earlier independent-evaluation switching rates, gait
+ratios, and physical-performance comparison therefore do not match the trained
+control protocol and must not be used as the final verdict on the temporal
+representation.
+
+The evaluator now reads the saved training decision interval by default and
+repeats each sampled high-level action for the same number of steps. The
+previous training metrics remain valid. The information-path probe also remains
+valid for representation diagnosis, but its per-sample gait probabilities are
+not executed-gait persistence measurements.
+
+The temporal model's student-latent terrain accuracy did improve from about
+0.691 to 0.783. Its latent changes between adjacent collected samples are
+smaller than the baseline, not larger. However, its selector probabilities have
+smaller top-two margins and cross the gait boundary more often when queried at
+every sample. This suggests a less decisive selector mapping, but its actual
+control impact must now be re-measured with the corrected 100-step option
+execution before accepting or rejecting the representation.
+
+### Corrected temporal-model evaluation (2026-07-15)
+
+Evaluation:
+
+```text
+runs/high_level_oracle_gait/20260714_v4_flat_ramp_rough_temporal_summary_iter050/independent_eval/20260715_three_terrain_decision100_iter049
+```
+
+With each selected gait held for the training-matched 100 environment steps:
+
+```text
+flat:  reward 0.8330, vx error 0.1981, switch rate 0.0001
+ramp:  reward 0.8036, vx error 0.2531, switch rate 0.0020
+rough: reward 0.7405, vx error 0.3410, switch rate 0.0015
+```
+
+The apparent high-frequency gait chattering disappears. Ramp and rough use
+pronking mostly at low speed, then move toward trotting as speed increases, but
+each sampled option is executed persistently. The earlier interval-1 evaluation
+underestimated ramp and rough performance and must be treated as invalid for
+policy comparison.
+
+The temporal representation is no longer rejected. A corrected
+decision-interval-100 evaluation of the pre-summary stronger-imitation model is
+required next. Only this matched comparison can determine whether the improved
+student-latent terrain classification brings a control benefit.
+
+### Matched baseline comparison and local-solution diagnosis (2026-07-15)
+
+The stronger-imitation baseline was re-evaluated with the same
+`decision_interval=100`. Temporal-summary minus baseline task averages:
+
+```text
+flat:  reward -0.0007, vx error +0.0005
+ramp:  reward -0.0018, vx error +0.0029
+rough: reward -0.0004, vx error +0.0066
+```
+
+The temporal student representation improves terrain classification from about
+0.691 to 0.783, but does not improve aggregate physical control. It also shifts
+ramp and rough toward more pronking. Therefore better task separability alone
+is insufficient.
+
+The last-ten-iteration on-policy option statistics expose the current local
+solution:
+
+```text
+rough pronking: observed option reward 48.69, advantage +0.042
+rough trotting: observed option reward 47.83, advantage -0.084
+```
+
+This differs from the rough-only control, which learns trotting. In the mixed
+checkpoint, rare trotting samples are evaluated from states produced by a
+long-running pronking policy and can pay a gait-transition cost. The update then
+reinforces the inherited pronking basin even when the representation carries
+more terrain information.
+
+The next controlled experiment keeps the trained temporal student/teacher
+representation but zero-initializes only the gait selector's final layer so all
+gaits initially receive equal sampling opportunity. The RMA encoders are frozen
+to isolate selector relearning. Reward, task distribution, option duration,
+absence of task ids, and zero continuous residuals remain unchanged. This is
+not gait supervision; it tests whether the earlier mixed result was maintained
+by inherited selector/path dependence.
+
+### Reset-selector result (2026-07-15)
+
+Run:
+
+```text
+runs/high_level_oracle_gait/20260715_v4_flat_ramp_rough_temporal_resetselector_iter050
+```
+
+The first five iterations were close to uniform over the four gaits, confirming
+that the inherited selector output was removed. Last-ten-iteration results:
+
+```text
+flat trotting:   0.982
+ramp pronking:   0.770
+rough trotting:  0.467
+reward:          0.8204
+vx error:        0.2048
+```
+
+Compared with the pre-reset temporal model, rough trotting increases from about
+0.325 to 0.467 while flat and ramp retain their broad preferences. Inherited
+selector bias was therefore part of the rough-pronking result, but not the only
+cause.
+
+During the first ten iterations, rough pronking and trotting have nearly equal
+normalized advantages (+0.070 and +0.072), while pronking's observed 100-step
+option reward is only about 0.225 higher. As pronking becomes more common,
+trotting is sampled increasingly as a transition from pronking-created states;
+its advantage becomes negative and the policy starts locking into pronking
+again.
+
+Do not repeat selector resets or extend PPO yet. The next diagnostic is a
+same-state paired fixed-gait audit on rough terrain at 1.0 m/s. It must first
+compare pronking and trotting over the training-matched 100-step horizon from a
+common reset state, then compare gait-conditioned context states and longer
+horizons if necessary. This will distinguish a genuine short-horizon reward
+preference from transition/path dependence.
+
+### Rough 1.0 m/s paired reset-state result (2026-07-15)
+
+Audit:
+
+```text
+runs/high_level_oracle_gait/paired_gait_live_reward_audit/20260715_rough_vx1_context0_h100
+```
+
+Across 192 paired environments from identical reset states:
+
+```text
+pronking - trotting weighted reward: -0.00155
+delta standard deviation:             0.02599
+P(pronking > trotting):                0.469
+
+pronking - trotting vx error:         +0.01450
+pronking - trotting mechanical power: +20.74
+pronking - trotting contact-slip score:+0.06561
+pronking - trotting impact score:      +0.02583
+```
+
+There is no strong universal winner at this point. Trotting has better speed
+tracking and lower mechanical power, while pronking has better contact-slip and
+impact scores. The unified weighted reward nearly cancels these trade-offs, so
+small sampling and state-distribution effects can select different local
+solutions. Rough-only trotting and mixed-training pronking are therefore not
+necessarily contradictory evidence of a coding error.
+
+The next paired audit uses 100 steps of pronking context before cloning the
+state. It compares continuing pronking with switching to trotting over the same
+100-step option horizon. A subsequent trotting-context audit will be needed for
+the opposite transition. These tests measure path dependence without gait
+labels or task-specific reward changes.
+
+### Rough 1.0 m/s pronking-context result (2026-07-15)
+
+Audit:
+
+```text
+runs/high_level_oracle_gait/paired_gait_live_reward_audit/20260715_rough_vx1_pronkcontext100_h100
+```
+
+After 100 common context steps of pronking:
+
+```text
+pronking - trotting weighted reward: +0.00609
+delta standard deviation:             0.02160
+P(pronking > trotting):                0.589
+PPO-matched return delta:             -0.0909 (near tie relative to std 1.56)
+```
+
+The common pronking context shifts the weighted-reward comparison from a small
+trotting advantage at reset (-0.00155 for pronking-minus-trotting) to a modest
+pronking advantage (+0.00609). Contact slip, impact, orientation, and scuffing
+favor continuing pronking, while mechanical power still favors trotting. By
+itself this suggests path dependence, but it cannot distinguish gait-specific
+inertia from a general change after spending 100 steps on the terrain. The
+paired win rate is only 58.9% and discounted option returns are nearly tied.
+
+The required symmetric control now uses 100 trotting context steps. If that
+context shifts the result toward trotting, the system has bidirectional gait
+inertia and PPO can amplify whichever gait becomes common first. If pronking
+still wins, the current 100-step reward window has a more direct pronking bias.
+
+### Rough 1.0 m/s trotting-context result (2026-07-15)
+
+Audit:
+
+```text
+runs/high_level_oracle_gait/paired_gait_live_reward_audit/20260715_rough_vx1_trotcontext100_h100
+```
+
+After 100 common context steps of trotting:
+
+```text
+pronking - trotting weighted reward: +0.00305
+delta standard deviation:             0.02910
+P(pronking > trotting):                0.594
+
+pronking - trotting vx error:         +0.00421
+pronking - trotting mechanical power: +19.83
+pronking - trotting contact-slip score:+0.06170
+pronking - trotting impact score:      +0.02402
+```
+
+Trotting context does not shift the comparison toward trotting. It produces a
+small pronking advantage similar to the pronking-context test, while trotting
+still has slightly better speed tracking and substantially lower mechanical
+power. Pronking again gains mainly from contact slip and impact scores.
+
+The symmetric result rejects the simple bidirectional-inertia explanation.
+What matters more is reaching states encountered after about 100 terrain steps,
+not which of the two gaits generated that context. In those later states the v4
+reward has a weak pronking preference, whereas at reset it has a weak trotting
+preference. All three comparisons have large overlap and small mean margins, so
+the reward still supplies an ambiguous selector signal. Do not change the
+network or add gait supervision based on this result. The next diagnostic
+should localize when along the rollout the preference changes and which raw
+physical terms cause that change.
+
+### Rough 1.0 m/s intermediate-context result (2026-07-15)
+
+Audit:
+
+```text
+runs/high_level_oracle_gait/paired_gait_live_reward_audit/20260715_rough_vx1_trotcontext050_h100
+```
+
+After only 50 common trotting steps, pronking-minus-trotting reward is already
+`+0.00242` with standard deviation `0.02863` and paired win probability `0.583`.
+The sign has therefore changed from the reset-state result before 50 context
+steps, rather than only near step 100. The physical trade-off is unchanged:
+trotting tracks speed better and uses about 19.4 less mechanical power, while
+pronking has higher contact-slip, impact, and scuffing scores.
+
+This initially suggested an early state-distribution change rather than
+gait-specific inertia. However, the context-length audits used separate random
+rollouts and their mean margins are much smaller than their paired variation.
+The time-resolved control below is therefore required before treating the sign
+change as systematic.
+
+### Rough 1.0 m/s time-resolved paired result (2026-07-15)
+
+Audit:
+
+```text
+runs/high_level_oracle_gait/paired_gait_live_reward_audit/20260715_rough_vx1_context0_h100_bins10
+```
+
+The evaluator now optionally records paired statistics in consecutive physical
+step bins. Across 192 paired environments, the full 100-step result again
+slightly favors trotting:
+
+```text
+pronking - trotting weighted reward: -0.00252
+delta standard deviation:             0.02269
+P(pronking > trotting):                0.438
+pronking - trotting vx error:         +0.01547
+pronking - trotting mechanical power: +20.71
+```
+
+The 10-step reward deltas are not monotonic:
+
+```text
+0-10:   -0.0482
+10-20:  +0.0022
+20-30:  +0.0265
+30-40:  -0.0194
+40-50:  +0.0112
+50-60:  +0.0132
+60-70:  -0.0163
+70-80:  +0.0034
+80-90:  +0.0061
+90-100: -0.0040
+```
+
+This rejects the stronger claim that the reward undergoes one stable early
+switch from trotting to pronking. Short-window preference oscillates with the
+evolving motion/contact state. Trotting consistently uses less mechanical
+power and is better on aggregate tracking, while pronking consistently receives
+better contact-slip and impact scores. The v4 weighted sum nearly cancels this
+trade-off, leaving a selector signal whose mean is much smaller than its
+variation and whose sign depends on the sampled horizon.
+
+The next step is structural rather than another routine audit: decide whether
+command tracking and power should dominate these small contact-score gains, or
+whether the present trade-off is physically intended and gait differentiation
+should not be expected on rough terrain. Do not continue PPO or change the
+reward automatically before that decision.
+
+## Ten-day deliverable scope reset (2026-07-15)
+
+The project objective is performance-first condition adaptation, not gait
+diversity for its own sake. A policy that mainly uses one gait can still be a
+successful result if it outperforms fixed single-gait policies under a valid
+unified physical objective. Distinct gaits should appear only where they provide
+a repeatable physical benefit.
+
+Confirmed constraints:
+
+- The deployed high-level policy receives only commanded velocity and
+  proprioceptive history. It receives no terrain ID, gait label, height scan,
+  depth camera, or lidar input.
+- All terrains use one physical reward formula. Normalization may depend on
+  general physical quantities such as command speed, robot mass, elapsed time,
+  travelled distance, or valid contact time, but not on terrain identity.
+- Core ten-day scenarios are flat ground, ramps, realistically rough terrain,
+  and external pushes.
+- Stepping stones and deep gaps remain optional stress tests because a
+  proprioception-only policy cannot anticipate unseen footholds fairly.
+- The required deliverable is an interpretable adaptive-policy comparison,
+  metrics, and visual playback. Broad sensor integration and forced gait
+  differentiation are out of scope for this deadline.
+
+The final ten-day policy must retain a performance-improving adaptation path
+even if discrete gait selection converges mostly to trotting. Selector-only is
+therefore a training/diagnostic stage, not the required final capability. The
+intended training sequence is:
+
+1. stabilize gait selection with default continuous parameters;
+2. within the same training process, gradually enable small continuous
+   parameter adjustments from the default template;
+3. judge success by raw physical metrics against fixed default trotting.
+
+A mostly-trotting policy is a valid successful result if its proprioception-
+conditioned frequency, foot-swing height, or other continuous adjustments
+produce repeatable performance gains. Neither visible gait diversity nor any
+preassigned terrain-to-gait mapping is required.
+
+## 步态条件化连续参数分支（2026-07-16）
+
+当前结构中的步态选择和连续参数在给定状态后相互独立：无论最终采样到哪种
+步态，频率、抬脚高度等连续参数都来自同一个高斯分布。这隐含假设“同一个
+连续参数偏移对四种步态具有相同含义”，与实际 gait template 的执行效果不符。
+
+已实现一个受控的小结构修改：
+
+```text
+连续参数均值 = 共享基础输出 + 被选步态的专属修正
+```
+
+实现原则：
+
+- 保留原有共享特征提取、步态选择、教师学生模块和统一物理奖励。
+- 四个步态修正分支全部从严格的零开始，因此新增结构不会在初始化时改变旧模型行为。
+- 训练时先采样步态，再使用该步态对应的连续参数分布；只有被采样步态的修正分支参与本次连续动作概率和梯度。
+- 连续参数标准差暂时仍由四种步态共享，避免同时引入过多自由度。
+- 启用该结构时强制 `selector_hold_steps=0`，避免执行旧步态却使用新步态连续参数的错配。
+- 训练日志新增每种步态下五个连续残差的均值和绝对值均值。
+- 分阶段训练使用 `freeze_rma` 时，现在会同时冻结历史编码器、教师编码器和物理状态预测器；配合冻结选择器后，步态决策通路不会在连续参数对照中暗中变化。
+- 修正了既有 `residual_l2_coef`：旧实现对已断开梯度的采样动作求平方，只记录数值而不能约束网络；现在惩罚当前网络针对已采样步态输出的连续参数均值，才会真正把调节限制在默认模板附近。
+- 新增 `--student-latent-only`：从稳定检查点进入连续参数阶段时，全程使用实机可获得的学生隐变量，不再重新启动“教师隐变量逐步切换到学生隐变量”的日程，避免输入变化和特权信息污染连续参数对照。
+
+训练开关：
+
+```text
+--gait-conditioned-residuals
+```
+
+兼容性：
+
+- 不加开关时保持原有共享连续参数结构。
+- 旧检查点可初始化新结构；缺少的步态修正参数自动保持为零。
+- 新检查点的训练参数会记录该结构，独立评测、混合地图播放和信息通路采集会自动重建正确模型。
+
+实现过程中还修正了一个既有的训练/评测不一致：启用
+`adaptation_temporal_summary` 后，训练会先把十步历史转换为时间统计量，
+但旧版学生部署入口曾绕过该转换，直接把原始历史送入适应网络。现在学生独立
+评测和播放统一调用与训练相同的 `encode_student`。因此：
+
+- 训练日志不受影响；
+- 显式调用 `encode_student` 的信息通路探针不受影响；
+- 2026-07-16 修复前，对启用了时间统计编码的检查点所做的学生独立评测需要重跑；
+- 未启用时间统计编码的旧检查点不受影响。
+
+纯网络测试已经通过，覆盖以下六项：
+
+1. 旧检查点加载后，新旧结构在零修正时输出一致；
+2. 每种步态只读取自己的连续参数修正；
+3. 连续动作日志概率使用实际采样步态对应的分布；
+4. 只有被采样步态的修正分支收到该样本的连续动作梯度；
+5. 学生部署入口与训练阶段使用相同的时间统计历史编码；
+6. 连续参数靠近零的惩罚具有真实梯度，且只作用于对应步态修正分支。
+
+下一次短训练必须在相同数据、初始化和训练预算下比较：
+
+```text
+A. 连续参数固定为零
+B. 原共享连续参数分支
+C. 共享基础参数 + 步态专属修正
+```
+
+最终依据仍是相对固定默认小跑的原始物理指标，而不是是否出现更多步态。
+只有 C 在新种子和未见参数组合上稳定优于 A/B，才能保留该结构。
+
+后续复杂结构不自动叠加：
+
+- 如果教师物理隐变量有效而学生历史隐变量明显不足，才考虑增加未来本体状态预测。
+- 如果单场景分别能学好、混合场景却出现明确的训练方向冲突，才考虑更完整的多专家网络。
+- 如果当前奖励差异本身弱且不稳定，增加上述结构不能解决评价目标问题。
+
+### 两轮实现检查结果（2026-07-16）
+
+运行目录：
+
+```text
+runs/high_level_oracle_gait/20260716_v4_flat_ramp_gaitcond_residual_smoke_iter002
+```
+
+这次运行只检查新分支是否按设计训练，不用于判断性能优劣。检查结果：
+
+- 两轮指标和两个检查点都完整生成，所有数值均为有限值。
+- `gait_conditioned_residuals`、`student_latent_only`、冻结选择器、冻结师生适应模块、连续参数从零初始化等开关均按预期生效。
+- 动作截断率和“采样步态与实际执行步态不一致率”均为 0。
+- 与初始化检查点逐参数比较，步态选择器、学生/教师适应模块和物理状态预测头的最大差异均严格为 0。
+- 训练中只采样到了小跑和双脚跳，因此这两个步态的专属连续参数分支发生了更新；未采样到的跳跃和踱步分支保持严格为 0。这证明梯度只进入实际被选步态的分支。
+- 第 0 到第 1 轮，统一物理得分约为 `0.8348 -> 0.8371`，速度误差约为 `0.1874 -> 0.1913`。两轮太短且采样噪声较大，不能据此宣称性能提高或下降。
+- 日志中的连续参数绝对值包含标准差为 `0.1` 的探索噪声；判断网络是否真正偏离零，应查看连续参数均值头的权重或独立确定性评测，不能把采样动作绝对值直接当成已学偏移。
+
+结论：新结构通过了实现正确性检查，可以进入同初始化、同预算的受控比较；尚未通过性能验证，不能直接用于长训练。
+
+### 同预算短对照结果（2026-07-16）
+
+训练对照：
+
+```text
+共享连续参数：
+runs/high_level_oracle_gait/20260716_v4_flat_ramp_shared_residual_matched_iter010
+
+共享基础 + 步态专属修正：
+runs/high_level_oracle_gait/20260716_v4_flat_ramp_gaitcond_residual_matched_iter010
+```
+
+两条训练均从同一个稳定的平地/斜坡选择器检查点开始，冻结选择器、学生/教师适应模块和物理状态预测头，连续参数均值从零开始。环境数、每轮样本数、PPO 更新预算、探索标准差和连续参数靠近零的约束完全一致。由于训练脚本尚未固定随机种子，这是一轮低成本筛选，不是最终统计证明。
+
+10 轮训练期均值：
+
+```text
+                         共享分支       步态专属分支
+统一物理得分             0.84265        0.84331
+速度误差                 0.17733        0.17612
+连续参数均值平方（末轮） 0.00445        0.01213
+动作截断率               0              0
+```
+
+训练期差异很小，而步态专属分支的连续偏移增长约为共享分支的 2.7 倍。因此不能把训练期的 `0.00066` 得分差解释为结构优势。
+
+四个代表点评测目录：
+
+```text
+runs/high_level_oracle_gait/20260716_matched_residual_eval
+```
+
+使用平地 1.0/2.0 m/s、斜坡 1.0/2.0 m/s，每点 16 个环境、500 步：
+
+```text
+                         零连续参数     共享分支       步态专属分支
+平均统一物理得分         0.78225        0.78707        0.78602
+平均速度误差             0.30109        0.28944        0.29106
+平均结束率               0.02472        0.02466        0.02488
+平均执行残差绝对值       0              0.05098        0.07481
+```
+
+逐点解释：
+
+- 平地 1.0：步态专属分支最好，但差距很小。
+- 平地 2.0：共享分支略好，步态专属分支反而低于零参数基线。
+- 斜坡 1.0：共享分支的得分和速度误差最好。
+- 斜坡 2.0：两个连续分支都明显降低速度误差；共享分支得分略高，步态专属分支速度误差仅再低约 `0.0016`。
+- 三者的结束率近似相同，改善不是靠更频繁重置换来的。
+
+当前决定：
+
+```text
+步态专属连续参数结构没有通过“优于更简单共享结构”的筛选，暂不扩大训练。
+共享连续参数分支用更小偏移取得略好的整体结果，并在斜坡 2.0 上出现值得复核的改善。
+下一步只对共享分支做平地/斜坡全部八个固定速度点的高样本独立评测。
+如果完整评测不能稳定优于零参数基线，则停止本轮连续参数路线；
+如果主要在高速斜坡稳定获益，则保留简单共享分支并把结论限定为局部性能调节。
+```
+
+### 完整复核与停止结论（2026-07-16）
+
+共享连续参数分支随后完成平地/斜坡各四个固定速度、每点 32 环境和 1000 步的完整评测：
+
+```text
+零连续参数：
+  平均统一物理得分 = 0.817733
+  平均速度误差     = 0.224853
+
+共享连续参数：
+  平均统一物理得分 = 0.818841  （+0.001108）
+  平均速度误差     = 0.225008  （+0.000155，略差）
+```
+
+共享分支在斜坡 2.0 m/s 上提高得分约 `0.01495`、降低速度误差约 `0.01375`，但在斜坡 1.5 m/s 上降低得分约 `0.00510`、增大速度误差约 `0.01151`。整体结果是速度误差不变、得分仅千分级变化，不能称为稳定性能提升。
+
+评测基础设施随后新增 `--seed`，同时固定并记录 Python、NumPy、CPU Torch 和 GPU Torch 随机数；多速度子进程使用 `seed + 速度点序号`。还补充保存了完整统一得分以及机械功率、运输代价、接触滑移、触地冲击、擦碰率等原始物理量。
+
+固定种子 `21600` 的四点低成本比较曾得到：
+
+```text
+                         零连续参数     共享分支       步态专属分支
+平均统一物理得分         0.785187       0.785223       0.786425
+平均速度误差             0.292236       0.290777       0.289988
+平均执行残差绝对值       0              0.049158       0.074637
+```
+
+表面上步态专属分支比零参数高 `0.001238` 得分、低 `0.002248` 速度误差。但用相同检查点和相同名义种子重复零参数评测后，GPU PhysX 仍表现出不可忽略的非确定性：
+
+```text
+同一零参数基线两次运行的四点平均绝对差：
+  统一物理得分 = 0.002739
+  速度误差     = 0.010315
+  横向偏移     = 0.021187
+```
+
+基线自身重复波动分别约为候选得分效应的 2.2 倍、速度误差效应的 4.6 倍。固定种子可以减少随机来源，但不能让 GPU PhysX 逐步严格确定。因此当前千分级差异不能支持结构有效的结论，继续重复无配对仿真只会增加成本而不能消除归因问题。
+
+最终决定：
+
+```text
+1. 步态专属连续参数分支未通过“效果大于评测噪声且优于简单共享分支”的门槛，停止扩大训练。
+2. 共享连续参数分支也未证明相对零参数有稳定总体收益，暂不作为十天交付主线。
+3. 两种实现保留为默认关闭的实验开关，不删除，也不据此叠加未来预测或完整多专家结构。
+4. 当前交付主线回到更可靠的默认连续参数策略，先完成相对固定默认小跑的核心场景原始物理指标比较。
+5. 若以后重启连续参数研究，应采用同一仿真状态快照下的策略成对比较，或多个独立重复给出置信区间；不能再解释小于基线重复波动的单次差异。
+```
+
+### 零连续参数不等于项目目标已达成（2026-07-16）
+
+停止扩大步态专属连续参数分支，只是因为它没有证明稳定增益，不代表“零连续参数的选择器”已经成为最终方案。
+
+必须区分三种结果：
+
+```text
+1. 选择器在不同状态下选择不同步态，并稳定优于强制小跑：有实用自适应价值。
+2. 选择器大部分时间选择小跑，但通过少数有必要的切换或其他可学调节稳定提升原始物理指标：仍然有价值。
+3. 选择器几乎始终选择小跑，且原始物理指标不优于强制小跑：功能上等于更复杂的固定小跑，还增加错误切换和计算开销，不能称为成功。
+```
+
+最新的平地/斜坡两场景选择器不是完全的全小跑：它在限定分布中学会了平地偏小跑、斜坡低中速偏跳跃。但加入粗糙地形后曾出现斜坡的跳跃偏好错误迁移到粗糙地形，而粗糙地形单独训练明确选择小跑。因此，当前只能说“结构可以产生条件化选择”，还不能说“全场景自适应已经提升性能”。
+
+下一个必须回答的问题不是“是否出现多种步态”，而是：
+
+```text
+在相同场景、速度和扰动预算下，
+零连续参数的自适应选择器是否在速度误差、跌倒率、功率、滑移、冲击和擦碰上稳定优于强制小跑。
+```
+
+### 将当前步态作为统一连续参数网络的显式输入（2026-07-17）
+
+新增可选开关：
+
+```text
+--gait-input-residuals
+```
+
+它的计算结构是：
+
+```text
+本体历史和学生状态摘要
+        ↓
+一套状态特征提取网络
+        ↓
+状态特征 + 当前采样步态的四位代码
+        ↓
+同一套两层连续参数网络
+        ↓
+步频、接触持续比、摆腿高度、站宽、身体俯仰五个调节值
+```
+
+四种步态共用完全相同的网络权重，没有四套独立网络，也不再使用“基础调节值 + 步态专属修正值”的相加表示。为了保证强化学习概率计算正确，网络会为四个步态代码分别计算候选连续参数分布，再只取实际采样步态对应的一组。
+
+兼容性和保护：
+
+```text
+1. 新开关默认关闭，不改变旧训练和旧检查点。
+2. 与旧的 --gait-conditioned-residuals 互斥。
+3. 从旧选择器检查点加载时，新网络最后一层从零输出开始。
+4. 步态选择保持时间必须为零，防止“请求步态”与“实际执行步态”不一致。
+5. 独立评测、信息采集和可视化脚本都会从 args.json 恢复该结构。
+```
+
+新增 `scripts/test_gait_input_residuals.py`，验证了：两种旧/新步态条件方式不能同时开启；旧检查点可加载；新网络初始输出为零；不同步态代码能产生不同输出；动作概率和梯度使用实际采样步态。新测试 `5/5` 通过，旧步态修正结构测试 `6/6` 仍通过。
+
+极短实际训练检查：
+
+```text
+runs/high_level_oracle_gait/20260717_v4_flat_ramp_gait_input_residual_smoke_iter001
+
+16 个环境
+1 轮更新
+200 个物理步
+平地/斜坡各 8 个环境
+选择器、学生/教师编码器和物理状态预测头冻结
+```
+
+运行成功，动作维度仍为 `9`，连续参数新网络开关正确激活，最后输出层从全零更新为有限非零值（权重范数 `0.01073`）。这只证明结构、概率计算和梯度链路可用，不证明性能提升。
+
+未经用户确认，不继续启动配对长训练或多点仿真评测。

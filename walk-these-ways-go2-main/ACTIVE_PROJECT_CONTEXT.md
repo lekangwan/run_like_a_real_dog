@@ -9,7 +9,133 @@ Current source-of-truth plan:
 CURRENT_GAIT_ADAPTATION_PLAN.md
 ```
 
-Latest status, 2026-07-04:
+Latest status, 2026-07-17:
+
+```text
+Current structural candidate:
+  --gait-input-residuals
+
+The continuous parameter path now optionally uses one unified network:
+  shared state features + sampled gait code
+    -> one shared two-layer residual network
+    -> five continuous residual means.
+
+This does not create four complete per-gait networks and does not use the old
+"shared residual + per-gait additive correction" representation. The same
+network weights are used for all gaits; the sampled gait is an explicit input.
+For correct PPO probability accounting, the actor evaluates the same network
+for all four gait codes and selects the residual distribution belonging to the
+actually sampled gait.
+
+The new mode is mutually exclusive with --gait-conditioned-residuals, remains
+off by default, loads old selector-only checkpoints with a zero-output final
+residual layer, and is restored by evaluation, collection, and playback tools.
+
+One-iteration implementation smoke test:
+  runs/high_level_oracle_gait/20260717_v4_flat_ramp_gait_input_residual_smoke_iter001
+
+Result:
+  16 environments, one update, and 200 physical steps completed. The existing
+  selector/RMA/physical-state modules stayed frozen; all five residual
+  dimensions were active; the new final layer changed from zero to finite
+  nonzero weights. Five new unit tests and the six previous residual tests pass.
+  This validates implementation and gradient flow only, not performance.
+
+No longer matched training or evaluation may be started without first stating
+the expected runtime and receiving user confirmation.
+```
+
+Previous structural experiment, 2026-07-16:
+
+```text
+Ten-day objective:
+  improve raw physical metrics over fixed default trotting;
+  visible gait diversity is optional;
+  deployment input remains commanded velocity + proprioceptive history only.
+
+Current structural experiment:
+  --gait-conditioned-residuals
+
+The high-level actor now optionally represents continuous gait parameters as:
+  shared residual output + selected-gait-specific zero-initialized correction.
+
+This fixes the old assumption that one gait-independent residual distribution
+has the same meaning for pronking, trotting, bounding, and pacing. The sampled
+gait now selects the matching Normal residual distribution for PPO probability
+and gradient calculation.
+
+No reward, task label, terrain ID, sensor input, or low-level WTW policy was
+changed. Old behavior remains the default and old checkpoints can initialize
+the new structure without changing their initial outputs.
+
+Evaluation consistency fix:
+  act_student now calls the same encode_student path used during training.
+  Independent evaluations made before 2026-07-16 for checkpoints with
+  adaptation_temporal_summary=true must be rerun; training logs and explicit
+  encode_student information-path probes remain valid.
+
+Staged-training consistency fix:
+  residual_l2_coef now penalizes the current differentiable residual mean for
+  the sampled gait. The previous cached-action square had no policy gradient.
+  freeze_rma now also freezes the physical-state prediction head so a frozen
+  selector path cannot drift indirectly during residual-only training.
+  --student-latent-only keeps checkpoint-initialized residual stages on the
+  deployable student latent instead of restarting privileged-latent annealing.
+
+Next required experiment:
+  compare zero residual, old shared residual, and gait-conditioned residual
+  under matched initialization/training budget; judge by raw physical metrics.
+
+Two-iteration implementation smoke test completed:
+  runs/high_level_oracle_gait/20260716_v4_flat_ramp_gaitcond_residual_smoke_iter002
+
+Result:
+  all intended switches were active; both metric rows were finite; action clip
+  and sampled/executed gait mismatch rates were zero. The frozen selector,
+  student/teacher adaptation modules, and physical-state head were byte-for-byte
+  unchanged from the initialization checkpoint. Only the sampled trotting and
+  pronking residual branches updated; unsampled bounding and pacing branches
+  stayed exactly zero. This validates the training mechanism, not performance.
+
+Matched ten-iteration screening completed:
+  zero residual vs shared residual vs gait-conditioned residual was evaluated
+  on flat/ramp at 1.0 and 2.0 m/s with the same short evaluation budget.
+  Average reward was 0.7823 / 0.7871 / 0.7860, and average vx error was
+  0.3011 / 0.2894 / 0.2911. The gait-conditioned branch used substantially
+  larger residuals but did not beat the simpler shared branch. Do not scale the
+  gait-conditioned structure. The shared branch alone merits one full
+  eight-speed confirmation because both residual variants improved ramp 2.0.
+
+Full and fixed-seed follow-up changed that interpretation:
+  the shared residual full eight-speed evaluation was essentially tied with
+  zero residual (reward +0.0011, vx error +0.0002). Its ramp-2.0 gain was offset
+  by a ramp-1.5 loss. A four-point seeded comparison gave the gait-conditioned
+  branch only +0.00124 reward and -0.00225 vx error versus zero residual.
+  Repeating the same zero-residual checkpoint with the same nominal seeds still
+  changed reward by 0.00274 and vx error by 0.0103 on average because GPU PhysX
+  is not strictly deterministic. The candidate effect is below this measured
+  repeat noise. Therefore neither residual branch has established a reliable
+  performance gain, and the gait-conditioned branch is stopped.
+
+Returning to zero continuous residuals is a control decision, not a successful
+final policy. A selector that chooses trotting almost everywhere and does not
+improve raw physical metrics over forced trotting adds no practical value and
+can be worse because of erroneous gait switches. The next claim must therefore
+be earned by a direct adaptive-selector versus forced-trot comparison; gait
+diversity alone is not success, but identical all-trot behavior is not
+adaptation either.
+
+Evaluation infrastructure now accepts and records `--seed` and exports the
+complete canonical score set plus raw power, transport, contact-slip, impact,
+scuffing, orientation, and related primitives. Seeds reduce avoidable
+randomness but do not make GPU PhysX trajectories identical.
+
+Do not automatically add future-state prediction or a full mixture-of-experts
+network. Add prediction only if student history representation is the measured
+bottleneck; add experts only if mixed-task gradient conflict is demonstrated.
+```
+
+Historical status snapshot, 2026-07-04:
 
 ```text
 Clean no-reference direction implemented:
