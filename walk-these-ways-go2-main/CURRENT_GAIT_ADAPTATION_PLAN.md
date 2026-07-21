@@ -6,6 +6,43 @@ This is the current source-of-truth project note for the high-level Go2 gait
 adaptation work. It supersedes the next-step recommendations in
 `CONVERSATION_HANDOFF_20260608.md` and `CONVERSATION_HANDOFF_20260611.md`.
 
+## Operational Safety Rule
+
+Effective 2026-07-18:
+
+```text
+Every day from 09:00 through 23:00 Asia/Shanghai, do not start, resume, or
+leave running any Go2 training, IsaacGym simulation, or GPU evaluation unless
+the user explicitly requests that specific run in the current conversation.
+
+This restriction overrides all previous general permission to keep training or
+evaluating autonomously. In that time window, proceed only with code reading,
+completed-result analysis, documentation/code edits, and non-GPU checks.
+
+When stopping work, inspect the host process list and nvidia-smi before claiming
+that no Go2 process remains. A check made only inside the sandbox is invalid.
+```
+
+## Night GPU Reliability
+
+2026-07-19 failure record:
+
+```text
+During an overnight IsaacGym evaluation, the laptop entered s2idle suspend.
+The NVIDIA kernel driver recorded Xid 31 MMU faults and then Xid 154: "Node
+Reboot Required". The current CUDA context became unusable even though
+nvidia-smi continued to show the display processes.
+
+Required response:
+  1. Stop all Go2 GPU work; do not retry the failed simulation in the same
+     desktop session.
+  2. Reboot before the next CUDA/PyTorch/IsaacGym process.
+  3. For future explicitly authorized overnight runs, wrap only that command
+     in a temporary systemd-inhibit sleep/idle inhibitor. This prevents an
+     automatic suspend while the process is active without changing the
+     user's permanent power-management configuration.
+```
+
 ## Goal
 
 Train a high-level policy on top of the frozen WTW Go2 low-level policy.
@@ -12810,3 +12847,172 @@ runs/high_level_oracle_gait/20260717_v4_flat_ramp_gait_input_residual_smoke_iter
 运行成功，动作维度仍为 `9`，连续参数新网络开关正确激活，最后输出层从全零更新为有限非零值（权重范数 `0.01073`）。这只证明结构、概率计算和梯度链路可用，不证明性能提升。
 
 未经用户确认，不继续启动配对长训练或多点仿真评测。
+
+### 步态输入连续参数网络：受控比较与休眠中断（2026-07-19）
+
+用户在当次对话中明确授权了夜间继续推进，因此完成了两个从同一平地/斜坡稳定选择器检查点出发的十轮受控训练：旧共享连续参数网络，以及
+`--gait-input-residuals`。两者均冻结了步态选择器、学生/教师历史编码器和物理状态预测头。
+
+```text
+                         旧共享网络       步态输入网络
+十轮平均训练得分          0.84309          0.84295
+十轮平均速度误差          0.17608          0.17684
+最后连续参数 L2           0.00445          0.00510
+动作裁剪率                0                0
+```
+
+这证明新网络的梯度和数值链路正常，并会在默认参数附近产生小幅、随步态改变的调节；不证明它提高性能。
+
+随后在平地/斜坡各四个速度点（0.5、1.0、1.5、2.0 m/s）、每点 32 环境、1000 步、随机种子 21750 下完成独立评测：
+
+```text
+                         零连续参数       旧共享网络       步态输入网络
+平均统一物理得分          0.81899          0.81859          0.81788
+平均速度误差              0.22323          0.22494          0.22650
+平均结束率                0.02115          0.02105          0.02112
+```
+
+步态输入网络在这一轮中平均得分更低、速度误差更高；但差异仍接近已知 GPU PhysX 重复波动，不能单凭这一轮否定结构。
+
+第二个随机种子 21850 已完整完成零连续参数基线：
+
+```text
+平均统一物理得分 = 0.81767
+平均速度误差     = 0.22685
+平均结束率       = 0.02118
+```
+
+与之配对的步态输入网络评测第一次在前三个平地点后被 s2idle 休眠中断。重启后，使用临时 `systemd-inhibit` 阻止休眠，已在新的输出目录完整重跑八个点：
+
+```text
+                         零连续参数       步态输入网络
+seed 21850 平均统一得分  0.81767          0.81948
+seed 21850 平均速度误差  0.22685          0.22419
+seed 21850 平均结束率    0.02118          0.02106
+```
+
+把 21750 与 21850 两个相同初始状态、相同速度点的配对评测合并后：
+
+```text
+步态输入网络相对零连续参数：
+  平均统一物理得分       +0.00035
+  平均速度误差           +0.00031  （略差）
+  平均结束率             -0.00007
+  平均机械功率           +0.58     （略差）
+  有正得分差异的点       7 / 16
+  有更低速度误差的点     8 / 16
+  平均实际连续修正绝对值  0.05564
+```
+
+解释：网络确实输出了稳定的小幅连续修正，说明实现和优化链路没有失效；但性能改变量远小于已知 PhysX 重复波动，两个种子的方向也相反，无法归因于这个结构。不能把 `+0.00035` 当作有效收益。
+
+最终决定：
+
+```text
+1. 停止扩大“当前步态作为连续参数网络输入”的路线；不再为它启动新的长训练或多种子调参。
+2. 保留开关和测试，供以后在更强的成对状态对照下复用，但不作为近期交付模型。
+3. 当前主线回到零连续参数的自适应选择器，对照强制小跑基线。
+4. 后续判断只看速度误差、结束率、机械功率、滑移、冲击、擦碰等原始物理指标；若自适应选择器没有稳定优于强制小跑，就不把“步态自适应”写成成功。
+```
+
+### 自适应选择器相对强制小跑：三随机种子核心基准（2026-07-20）
+
+为避免再用不同脚本、不同统计口径比较策略，`scripts/evaluate_high_level_policy_by_task.py` 新增了：
+
+```text
+--force-gait trotting
+```
+
+它不改变训练、不提供任务编号、不提供步态参考，也不改变环境奖励。它只在评测时把高层动作中的步态部分固定为小跑，同时保持连续参数为默认值。因此它回答的是：在相同地图、速度、随机种子和原始物理指标下，已经训练好的自适应选择器是否真的比固定小跑更有价值。
+
+另新增 `scripts/analyze_adaptive_vs_forced_trot.py`，把多随机种子的逐点结果汇总为可复用的 CSV 与 Markdown，避免手工挑选单次结果。
+
+评测设置：
+
+```text
+模型：20260713_v4_flat_ramp_per_env_baseline_continued_iter050/checkpoints/high_level_000049.pt
+输入：目标速度 + 本体历史压缩出的可部署学生隐变量；无任务编号、无步态参考
+连续参数：固定默认值
+场景：平地和上坡，各 0.5 / 1.0 / 1.5 / 2.0 m/s
+每点：32 环境、1000 步
+随机种子：21950、22050、22150
+```
+
+三随机种子的种子级平均差异（自适应选择器减去强制小跑）：
+
+```text
+全部八点：
+  统一物理得分       +0.00189
+  速度误差           -0.00164
+  结束率             +0.00005
+  机械功率           +5.22
+  接触滑移惩罚       -0.00326
+  冲击速度均方根     -0.02042
+  擦碰比例           -0.00191
+
+平地四点：
+  统一物理得分       -0.00033
+  速度误差           +0.00056
+  机械功率           +0.95
+  结论：没有可用收益；选择器本身也几乎始终选择小跑。
+
+上坡四点：
+  统一物理得分       +0.00412
+  速度误差           -0.00383
+  机械功率           +9.49
+  接触滑移惩罚       -0.00653
+  冲击速度均方根     -0.03864
+  擦碰比例           -0.00229
+```
+
+逐速度解释：
+
+```text
+上坡 1.0 / 1.5 m/s：最清楚的局部收益。奖励更高、速度误差更低，冲击和接触滑移更低；代价是更高机械功率。
+上坡 0.5 m/s：冲击更低，但功率明显更高，接触滑移反而略差，不能算明确获益。
+上坡 2.0 m/s：奖励和速度误差均不改善，不能把跳跃偏好外推到高速。
+平地：策略主要小跑，性能与固定小跑相同或略差，符合“没有必要切换就不应凭空获益”的预期。
+```
+
+阶段性判断：
+
+```text
+当前选择器已经通过了一个比“看起来有不同步态”更严格的检查：在坡地中速，选择不同步态会稳定改变真实物理量，并体现出更低冲击/更低接触滑移与更高功率之间的取舍。
+
+但它还没有证明“全场景都优于固定小跑”，也不能仅凭奖励提升宣称成功。近期交付中可把它表述为：在统一物理目标下，策略在部分坡地速度上自主选择更安全、跟踪更好的运动模式，同时暴露出能耗代价；平地则自然退化为小跑。
+```
+
+下一步：
+
+```text
+在不改训练、不加任务标签、不加步态参考的前提下，对未训练过的粗糙坡、横向推扰和踏石场景运行同一“自适应选择器 vs 强制小跑”成对基准。先做一个完整随机种子；若出现可解释的趋势，再补两个独立种子。这样才能区分“只会记住平地/斜坡”与“本体历史下存在一定的未见场景泛化”。
+
+### 未训练场景的三随机种子复核（2026-07-20）
+
+对第一轮未训练场景中看似有希望的两个点，使用随机种子
+22250、22350、22450 进行了三次严格成对复核。每次都比较同一个
+已训练策略与强制小跑；不改变输入、不加入任务编号或步态参考。
+
+```text
+横向推扰 1.5 m/s：
+  统一物理得分       -0.00833
+  速度误差           +0.01867
+  接触滑移惩罚       +0.01022
+  结论：第一轮的正向结果不能复现，不能作为泛化收益。
+
+踏石 1.7 m/s：
+  统一物理得分       +0.00348（三次均为正）
+  速度误差           -0.00765
+  机械功率           -3.39
+  冲击速度均方根     -0.00426
+  但结束率           +0.00022
+  接触滑移惩罚       +0.00128
+  擦碰比例           +0.00096
+```
+
+结论：踏石点存在可重复但很小、且带安全代价的取舍；它不能支持
+“未训练地形上整体优于固定小跑”的表述。当前模型最稳妥的结论仍是：
+在部分上坡中速点具有安全与跟踪方面的局部收益，而不是普遍优胜。
+停止继续扩大当前未训练场景的随机种子扫描，保留成对基准作为后续模型
+必须通过的检验。
+```

@@ -9,6 +9,91 @@ Current source-of-truth plan:
 CURRENT_GAIT_ADAPTATION_PLAN.md
 ```
 
+Operational safety rule, 2026-07-18:
+
+```text
+Every day from 09:00 through 23:00 Asia/Shanghai, do not start, resume, or
+leave running any Go2 training, IsaacGym simulation, or GPU evaluation unless
+the user explicitly requests that specific run in the current conversation.
+
+This rule supersedes every earlier blanket authorization to "keep running" or
+to launch long GPU work autonomously. During this daytime window, autonomous
+work is limited to reading code, analyzing completed outputs, editing code or
+documents, and CPU-only checks that do not interfere with the user's other
+projects.
+
+Before reporting that work has stopped, verify against the host process list
+and nvidia-smi. A sandbox-only process check is not sufficient.
+```
+
+Night GPU reliability note, 2026-07-19:
+
+```text
+An overnight IsaacGym evaluation was interrupted when the laptop entered s2idle
+suspend. The NVIDIA kernel driver then reported Xid 31 MMU faults followed by
+Xid 154: "Node Reboot Required". After this condition, nvidia-smi may still
+show the desktop GPU, but PyTorch cannot initialize CUDA.
+
+Do not retry a Go2 GPU job after this failure. Reboot the machine first. For
+future explicitly authorized overnight GPU work, run the job through a
+temporary systemd-inhibit sleep/idle inhibitor so an automatic laptop suspend
+cannot interrupt an active IsaacGym process. The inhibitor must end together
+with the job; do not make a persistent system-wide power-management change.
+```
+
+Latest execution status, 2026-07-19:
+
+```text
+The user explicitly authorized a night-time continuation of the controlled
+continuous-parameter comparison.
+
+Completed:
+  - 10 matched updates of the old shared residual network;
+  - 10 matched updates of --gait-input-residuals;
+  - one complete eight-point evaluation of zero residual, old shared residual,
+    and gait-input residual policies (seed 21750);
+  - a second complete paired zero-residual / gait-input evaluation (seed 21850),
+    rerun after reboot under a temporary sleep/idle inhibitor.
+
+Across the two paired seeds, the gait-input candidate changed the average
+unified physical reward by only +0.00035, increased velocity error by
+0.00031, and increased mechanical power by 0.58. The sign changes between
+seeds and the pointwise effects are inconsistent. Although the candidate did
+produce nonzero small residuals (mean absolute executed residual about 0.056),
+it did not produce a repeatable, physically interpretable improvement over
+zero residuals.
+
+Decision: stop expanding this continuous-parameter branch for the near-term
+deliverable. Preserve it as an opt-in experimental implementation, then return
+to the core benchmark: whether the adaptive selector with default parameters
+beats a forced-trot baseline on raw physical metrics.
+```
+
+Core selector benchmark, 2026-07-20:
+
+```text
+The independent evaluator now supports --force-gait trotting. It leaves the
+environment, command, reset protocol, reward profile, and metric collection
+unchanged; it only replaces the high-level gait action with the default trot
+template. This is a performance baseline, not training supervision.
+
+Three paired 8-point evaluations (seeds 21950, 22050, 22150) compared the
+deployable, no-task-label selector with default continuous parameters against
+forced trot. Results are stored in:
+  runs/high_level_oracle_gait/20260720_adaptive_vs_forced_trot/
+
+Flat terrain showed no useful gain: reward delta -0.00033 and power +0.95.
+On ramps, the selector produced a repeatable trade-off: reward +0.00412,
+impact -0.03864, contact-slip penalty -0.00653, scuffing -0.00229, and
+velocity error -0.00383 on average, while mechanical power increased +9.49.
+The clearest benefit is at 1.0 and 1.5 m/s; 2.0 m/s is not improved.
+
+This is evidence of a localized safety/tracking-versus-energy trade-off, not
+evidence of a universal adaptive-gait win. The next autonomous diagnostic is
+the identical paired comparison on unseen rough, push, and stepping-stone
+conditions.
+```
+
 Latest status, 2026-07-17:
 
 ```text
@@ -85,6 +170,26 @@ Staged-training consistency fix:
 Next required experiment:
   compare zero residual, old shared residual, and gait-conditioned residual
   under matched initialization/training budget; judge by raw physical metrics.
+
+2026-07-20 selected unseen-terrain follow-up:
+  The adaptive-selector versus forced-trot benchmark was repeated on the two
+  promising points with seeds 22250, 22350, and 22450. The runs use no task
+  ID, gait reference, or continuous residuals.
+
+  push_lateral at 1.5 m/s:
+    reward -0.00833, vx error +0.01867, contact slip +0.01022.
+    The first-seed benefit did not reproduce. Do not claim an adaptive gain.
+
+  stepping_stones at 1.7 m/s:
+    reward +0.00348 across all 3 seeds, vx error -0.00765, mechanical power
+    -3.39, and impact -0.00426. However done rate +0.00022, contact slip
+    +0.00128, and scuffing +0.00096 are slightly worse. This is a small,
+    mixed trade-off rather than evidence of robust overall OOD superiority.
+
+  Decision:
+    Stop expanding the current OOD seed sweep. The model has localized,
+    physically interpretable behavior but no broad unseen-terrain advantage.
+    Preserve the paired benchmark and report its limits honestly.
 
 Two-iteration implementation smoke test completed:
   runs/high_level_oracle_gait/20260716_v4_flat_ramp_gaitcond_residual_smoke_iter002
