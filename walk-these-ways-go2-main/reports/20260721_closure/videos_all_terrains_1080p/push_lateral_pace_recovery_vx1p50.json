@@ -1,0 +1,25 @@
+{
+  "task_id": "push_lateral_pace_recovery",
+  "vx": 1.5,
+  "checkpoint": "runs/high_level_oracle_gait/20260720_v4_flat_ramp_per_env_baseline_seed22550_stage2_iter050_direct/checkpoints/high_level_000049.pt",
+  "checkpoint_iteration": 49,
+  "duration_seconds": 5.0,
+  "fps": 10,
+  "frames": 50,
+  "resolution": [
+    1920,
+    1080
+  ],
+  "terrain_length": 20.0,
+  "terrain_width": 8.0,
+  "dominant_gait": "trot",
+  "gait_frame_counts": {
+    "pronk": 0,
+    "trot": 50,
+    "bound": 0,
+    "pace": 0
+  },
+  "mean_reward": 0.7245689415931702,
+  "mean_vx_abs_error": 0.32866730690002444,
+  "video": "reports/20260721_closure/videos_all_terrains_1080p/push_lateral_pace_recovery_vx1p50.mp4"
+}

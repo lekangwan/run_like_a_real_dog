@@ -169,6 +169,14 @@ def set_fixed_vx(env, vx):
     env.env.set_velocity_command(env.vx_cmd, 0.0, 0.0)
 
 
+def force_gait_action(env, gait_name):
+    """Build the default-template action for one fixed gait family."""
+    gait_id = GAIT_NAMES.index(gait_name)
+    action = torch.zeros(env.num_envs, env.num_high_level_actions, device=env.device)
+    action[:, gait_id] = 1.0
+    return action
+
+
 def augment_for_checkpoint(obs, task_index, num_tasks, use_task_onehot):
     if not use_task_onehot:
         return obs
@@ -273,7 +281,7 @@ def add_step_stats(stats, env, action, reward, done, info, requested_action=None
             stats["raw_term_sums"][key] += float(terms[key].sum().item())
 
 
-def finalize_stats(stats, task_id, condition, target_gait, vx):
+def finalize_stats(stats, task_id, condition, target_gait, vx, forced_gait=None):
     if torch.any(stats["last_gait_ids"] >= 0):
         stats["dwell_lengths"].extend(stats["current_dwell"][stats["last_gait_ids"] >= 0].tolist())
     steps = max(1, stats["steps"])
@@ -282,6 +290,8 @@ def finalize_stats(stats, task_id, condition, target_gait, vx):
         "task_id": task_id,
         "condition": condition,
         "target_gait": target_gait,
+        "control_mode": f"forced_{forced_gait}" if forced_gait else "adaptive",
+        "forced_gait": forced_gait or "",
         "cmd_vx": vx,
         "samples": stats["steps"],
         "reward_mean": stats["reward_sum"] / steps,
@@ -330,12 +340,12 @@ def write_summary(path, rows, checkpoint_path, iteration):
         f"- checkpoint_iteration: {iteration}",
         f"- decision_interval: {decision_interval}",
         "",
-        "| task | vx | target | pronk | trot | bound | pace | switch | dwell | vx_err | progress | slip | orientation | clearance | foot | clip | req_res | exec_res |",
-        "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| task | vx | mode | target | pronk | trot | bound | pace | switch | dwell | vx_err | progress | slip | orientation | clearance | foot | clip | req_res | exec_res |",
+        "|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
-            f"| {row['task_id']} | {row['cmd_vx']:.2f} | {row['target_gait']} "
+            f"| {row['task_id']} | {row['cmd_vx']:.2f} | {row['control_mode']} | {row['target_gait']} "
             f"| {row['pronk_ratio']:.3f} | {row['trot_ratio']:.3f} "
             f"| {row['bound_ratio']:.3f} | {row['pace_ratio']:.3f} "
             f"| {row['gait_switch_rate']:.3f} | {row['mean_gait_dwell_steps']:.2f} "
@@ -396,6 +406,8 @@ def run_child_evals(args, eval_items, output_dir):
             cmd.append("--render")
         if args.force_zero_residuals:
             cmd.append("--force-zero-residuals")
+        if args.force_gait:
+            cmd += ["--force-gait", args.force_gait]
         print(f"\nRunning independent eval: {spec.task_id} vx={vx:.2f}")
         subprocess.run(cmd, check=True)
         child_summary = child_dir / "independent_eval_summary.csv"
@@ -406,7 +418,8 @@ def run_child_evals(args, eval_items, output_dir):
 
 def print_row(row):
     print(
-        f"task={row['task_id']} vx={row['cmd_vx']:.2f} target={row['target_gait']} "
+        f"task={row['task_id']} vx={row['cmd_vx']:.2f} mode={row['control_mode']} "
+        f"target={row['target_gait']} "
         f"gaits[p/t/b/pa]={row['pronk_ratio']:.2f}/"
         f"{row['trot_ratio']:.2f}/{row['bound_ratio']:.2f}/{row['pace_ratio']:.2f} "
         f"switch={row['gait_switch_rate']:.3f} dwell={row['mean_gait_dwell_steps']:.2f} "
@@ -461,6 +474,15 @@ def main():
         help=(
             "Diagnostic: keep the model's gait choice but force all continuous "
             "residual actions to zero before stepping the environment."
+        ),
+    )
+    parser.add_argument(
+        "--force-gait",
+        choices=GAIT_NAMES,
+        default=None,
+        help=(
+            "Diagnostic baseline: override the policy's gait choice with one "
+            "fixed gait family and execute its default continuous parameters."
         ),
     )
     parser.add_argument("--no-spawn", action="store_true", help=argparse.SUPPRESS)
@@ -520,6 +542,7 @@ def main():
     print(
         f"oracle_condition_obs={oracle_condition_obs}, "
         f"selector_only={selector_only}, force_zero_residuals={args.force_zero_residuals}, "
+        f"force_gait={args.force_gait}, "
         f"eval_items={len(eval_items)}, reward_profile={reward_profile}, "
         f"decision_interval={decision_interval}"
     )
@@ -555,7 +578,9 @@ def main():
         with torch.inference_mode():
             for step in range(args.steps + args.warmup_steps):
                 if action is None or step % decision_interval == 0:
-                    if selector_only:
+                    if args.force_gait:
+                        requested_action = force_gait_action(env, args.force_gait)
+                    elif selector_only:
                         requested_action = model.act_student_selector_only(obs)
                     else:
                         requested_action = model.act_student(obs)
@@ -570,7 +595,14 @@ def main():
                 if step >= args.warmup_steps:
                     add_step_stats(stats, env, action, reward, done, info, requested_action=requested_action)
 
-        row = finalize_stats(stats, spec.task_id, spec.condition, spec.target_gait, vx)
+        row = finalize_stats(
+            stats,
+            spec.task_id,
+            spec.condition,
+            spec.target_gait,
+            vx,
+            forced_gait=args.force_gait,
+        )
         row["seed"] = args.seed
         row["decision_interval"] = decision_interval
         rows.append(row)

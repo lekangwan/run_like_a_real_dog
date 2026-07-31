@@ -3,6 +3,30 @@
 This file is the short entrypoint for the current Go2 gait-adaptation project.
 Read this before editing training, evaluation, or visualization scripts.
 
+Current short project entrypoint, 2026-07-23:
+
+```text
+PROJECT_STATUS_20260723.md
+```
+
+Read that file first for the current model, defensible claims, unresolved
+problems, report artifacts, and post-report development order.
+
+For the full technical reconstruction of the architecture, reward evolution,
+evaluation protocols, explored branches, and evidence chain, read:
+
+```text
+DETAILED_PROJECT_REVIEW_20260723.md
+```
+
+Report-closing evidence snapshot, 2026-07-21:
+
+```text
+REPORT_READY_PROJECT_STATUS_20260721.md
+```
+
+The report snapshot contains the detailed table and experiment protocol.
+
 Current source-of-truth plan:
 
 ```text

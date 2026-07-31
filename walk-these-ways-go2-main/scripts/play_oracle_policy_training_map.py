@@ -17,6 +17,7 @@ from gait_project_config import (
     VIS_TELEPORT_THRESH,
 )
 from train_high_level_oracle_ppo import (
+    GAIT_NAMES,
     GAIT_SHORT_NAMES,
     OracleConditionHighLevelEnv,
     parse_residual_action_mask,
@@ -81,6 +82,13 @@ def append_command_vx_obs(obs, cmd_vx, enabled):
     if not enabled:
         return obs
     return torch.cat((obs, cmd_vx[:, None].to(dtype=obs.dtype)), dim=-1)
+
+
+def force_gait_action(env, gait_name):
+    gait_id = GAIT_NAMES.index(gait_name)
+    action = torch.zeros(env.num_envs, env.num_high_level_actions, device=env.device)
+    action[:, gait_id] = 1.0
+    return action
 
 
 def set_deterministic_vx(env):
@@ -175,6 +183,18 @@ def main():
     parser.add_argument("--teleport-thresh", type=float, default=VIS_TELEPORT_THRESH)
     parser.add_argument("--mesh-type", default=TRAIN_MESH_TYPE, choices=["heightfield", "trimesh"])
     parser.add_argument("--sample-vx", action="store_true")
+    parser.add_argument(
+        "--decision-interval",
+        type=int,
+        default=None,
+        help="Override the saved high-level action interval used during playback.",
+    )
+    parser.add_argument(
+        "--force-gait",
+        choices=GAIT_NAMES,
+        default=None,
+        help="Playback baseline: ignore the selector and execute one fixed gait.",
+    )
     parser.add_argument("--no-render", action="store_true")
     args = parser.parse_args()
 
@@ -188,6 +208,13 @@ def main():
     oracle_condition_obs = not bool(run_args.get("no_oracle_condition_obs", False))
     selector_only = bool(run_args.get("selector_only", False))
     selector_latent_cmd_only = bool(run_args.get("selector_latent_cmd_only", False))
+    decision_interval = int(
+        args.decision_interval
+        if args.decision_interval is not None
+        else run_args.get("decision_interval", 1)
+    )
+    if decision_interval < 1:
+        raise ValueError("--decision-interval must be >= 1")
 
     specs = read_task_specs(args.task_map, style_reward_scale=0.0)
     specs = select_eval_specs(specs, args.eval)
@@ -219,7 +246,8 @@ def main():
     print(
         f"num_envs={env.num_envs}, obs_dim={env.obs_dim}, action_dim={env.num_high_level_actions}, "
         f"oracle_condition_obs={oracle_condition_obs}, selector_only={selector_only}, "
-        f"selector_latent_cmd_only={selector_latent_cmd_only}"
+        f"selector_latent_cmd_only={selector_latent_cmd_only}, "
+        f"decision_interval={decision_interval}, force_gait={args.force_gait}"
     )
     print(
         "residual_train_dims="
@@ -230,12 +258,16 @@ def main():
     reward_sum = 0.0
     done_sum = 0.0
     vx_error_sum = 0.0
+    action = None
     with torch.inference_mode():
         for step in range(args.steps):
-            if selector_only:
-                action = model.act_student_selector_only(obs)
-            else:
-                action = model.act_student(obs)
+            if action is None or step % decision_interval == 0:
+                if args.force_gait:
+                    action = force_gait_action(env, args.force_gait)
+                elif selector_only:
+                    action = model.act_student_selector_only(obs)
+                else:
+                    action = model.act_student(obs)
             next_base_obs, reward, done, _ = env.step(action)
             if not args.sample_vx:
                 set_deterministic_vx(env)

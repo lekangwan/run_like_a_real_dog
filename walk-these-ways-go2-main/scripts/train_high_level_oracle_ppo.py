@@ -485,6 +485,8 @@ def load_mixed_low_level_env(
     edge_reset_margin,
     teleport_thresh,
     mesh_type,
+    recording_width_px=None,
+    recording_height_px=None,
 ):
     config_go2(Cfg)
     with open(Path(logdir) / "parameters.pkl", "rb") as file:
@@ -502,6 +504,10 @@ def load_mixed_low_level_env(
     apply_condition_cfg(Cfg, "flat")
     Cfg.env.num_envs = num_envs
     Cfg.env.num_recording_envs = 0
+    if recording_width_px is not None:
+        Cfg.env.recording_width_px = int(recording_width_px)
+    if recording_height_px is not None:
+        Cfg.env.recording_height_px = int(recording_height_px)
     Cfg.terrain.min_init_terrain_level = 0
     Cfg.terrain.max_init_terrain_level = 0
     Cfg.terrain.num_rows = 1
@@ -559,6 +565,8 @@ class OracleConditionHighLevelEnv:
         selector_hold_steps=3,
         terrain_length=None,
         terrain_width=None,
+        recording_width_px=None,
+        recording_height_px=None,
     ):
         self.specs = specs
         self.oracle_condition_obs = oracle_condition_obs
@@ -578,6 +586,8 @@ class OracleConditionHighLevelEnv:
             edge_reset_margin,
             teleport_thresh,
             mesh_type,
+            recording_width_px=recording_width_px,
+            recording_height_px=recording_height_px,
         )
         self.env = HighLevelGaitWrapper(
             low_env,
