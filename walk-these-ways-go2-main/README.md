@@ -1,252 +1,286 @@
-# Sim-to-Real project on Unitree Go2
+# 基于本体感知历史的 Go2 高层步态自适应
 
-## Overview 
+本项目在冻结的 Walk These Ways（WTW）Go2 底层运动策略之上增加高层控制器，
+研究机器人能否只依靠目标速度和本体感知历史，自主选择步态并调整连续步态参数。
 
-This repository is forked from [walk-these-ways](https://github.com/Improbable-AI/walk-these-ways), which is a Go1 Sim-to-Real Locomotion Starter Kit. It seems that [walk-these-ways](https://github.com/Improbable-AI/walk-these-ways) can be untilized on Unitree [A1](https://github.com/fan-ziqi/dog_rl_deploy) with simple modifications, since those robots are base on [unitree-legged-sdk](https://github.com/unitreerobotics/unitree_legged_sdk). 
+项目的目标不是人为制造更多步态，而是回答：
 
-However, the brand-new architecture [unitree-sdk2 ](https://github.com/unitreerobotics/unitree_sdk2)is not based on UDP anymore, so this project aims to train and deploy walk-these-ways on Unitree Go2 by modifying SDK interfaces.
+> 与固定小跑相比，状态相关的高层步态决策能否在统一物理评价下，带来可重复的
+> 速度跟踪、稳定性、接触安全或能耗改善？
 
-## Requirements 
-* miniconda
-* pytorch 1.10 with cuda-11.3
-* Isaac Gym
-* Nvidia GPU with at least 8GB of VRAM
+## 当前状态
 
----
-## Train and Play
-Clone this repository and install:
+当前已经得到一个局部有效、但边界明确的仿真原型：
 
-``` bash
-git clone https://github.com/Teddy-Liao/walk-these-ways-go2.git
-cd walk-these-ways-go2
+- 部署侧输入只有目标前进速度和十帧本体感知历史；
+- 不向策略输入任务编号、地形编号、目标步态标签、相机或雷达；
+- 平地和上坡使用同一套物理奖励；
+- 平地上策略几乎始终选择小跑，表现与固定小跑基本相同；
+- 中速上坡上策略会较多选择同步跳步态；
+- 中速上坡相对固定小跑改善了综合得分、速度误差、接触滑移和冲击；
+- 改善伴随更高机械功率；
+- 高速上坡和多数未见地形没有建立稳定优势；
+- 三种连续参数网络均未取得超过仿真波动的可重复收益；
+- 尚未完成仿真到实机迁移。
+
+因此，本项目目前不能声称完成了全地形步态自适应。更准确的结论是：
+
+```text
+仅依赖目标速度与本体感知历史，高层策略可以在平地和上坡之间形成条件与速度
+相关的步态选择；该选择在部分中速上坡条件下改善跟踪和接触安全，但增加能耗，
+且收益尚不能推广到高速上坡和所有未见地形。
+```
+
+## 系统结构
+
+```text
+目标速度 + 十帧本体感知历史
+               |
+               v
+学生历史编码器：估计当前环境和动力学状态
+               |
+               +------> 预测通用物理状态
+               |
+               v
+高层步态选择器：同步跳 / 小跑 / 跳跃 / 踱步
+               |
+               +------> 可选的五个连续参数修正
+               |
+               v
+冻结的 WTW Go2 底层策略
+               |
+               v
+十二个关节动作
+```
+
+训练时，教师编码器可以读取仿真提供的 14 维通用物理量，包括地形高度统计、
+摩擦、负载、质心偏移、推扰状态、身体高度和姿态。部署时不使用教师，只保留
+从本体历史推断状态的学生网络。
+
+高层输出包括四种步态：
+
+| 英文名称 | 中文说明 |
+|---|---|
+| `pronking` | 四足近似同步的跳跃步态 |
+| `trotting` | 对角腿交替的小跑步态 |
+| `bounding` | 前后腿组交替的跳跃步态 |
+| `pacing` | 同侧腿交替的踱步步态 |
+
+以及五个连续参数：
+
+```text
+步频、触地时长、抬脚高度、站立宽度、身体俯仰
+```
+
+## 统一物理评价
+
+所有训练场景使用同一套奖励公式，不根据地形编号切换奖励权重。当前评价包含：
+
+- 目标速度跟踪和存活；
+- 身体姿态与角速度；
+- 横向漂移和垂直运动；
+- 接触期间的足端滑移；
+- 触地冲击和摆动期擦碰；
+- 关节机械功率；
+- 动作变化和连续参数健康状态。
+
+统一规则有助于减少地形特定先验，但并不自动等于绝对公平。指标定义、归一化、
+统计窗口和权重仍会影响结果。项目对奖励经历了在线与离线一致性检查、固定配置
+检查、公平参数搜索和独立随机种子复核。完整过程见
+[`DETAILED_PROJECT_REVIEW_20260723.md`](DETAILED_PROJECT_REVIEW_20260723.md)。
+
+## 核心结果
+
+主结果来自 32 个并行环境、三个独立评测随机种子，并使用相同地图、速度、底层
+策略和运行长度，对比：
+
+```text
+自适应高层策略
+对比
+同一模型检查点下强制使用默认小跑
+```
+
+![核心结果](reports/20260721_closure/core_result_figure.png)
+
+目前最可靠的观察是：
+
+- 平地超过 99.6% 使用小跑，没有获得有意义的额外收益；
+- 上坡 1.0 和 1.5 m/s 出现较多同步跳；
+- 上坡平均综合得分约提高 `0.0041`；
+- 上坡平均速度误差约降低 `0.0038`；
+- 上坡接触滑移、冲击和擦碰有所降低；
+- 上坡机械功率平均增加约 `9.49`；
+- 上坡 2.0 m/s 没有改善。
+
+这些结果表示“安全与跟踪改善换取更高能耗”的局部取舍，不代表自适应策略在
+所有指标和所有地形上都优于固定小跑。
+
+汇报材料见 [`reports/20260721_closure/`](reports/20260721_closure/)。
+
+## 代码入口
+
+### 推荐阅读的最小实现
+
+[`high_level_minimal/`](high_level_minimal/) 提供不依赖原大型 `scripts/` 的高层
+主线实现，包含：
+
+```text
+任务分配
+环境和底层模型加载
+高层步态封装
+教师学生网络
+PPO 强化学习
+两阶段训练
+独立评测
+可视化和录像
+```
+
+从零学习时先读：
+
+[`high_level_minimal/LEARNING_ROADMAP.md`](high_level_minimal/LEARNING_ROADMAP.md)
+
+重要说明：
+
+> 最小实现已经通过语法、依赖、核心数值等价和 CPU 训练更新检查，但尚未完成
+> Isaac Gym 短训练验证。当前汇报结果由原 `scripts/` 实验链产生，不能假定
+> 最小实现已经复现了相同数值结果。
+
+### 历史实验实现
+
+`scripts/` 保留完整实验演化、奖励审查、成对评测、信息通路诊断和历史兼容功能。
+它适合追溯结果，但不建议作为第一次阅读项目的入口。
+
+## 环境要求
+
+本地实验使用过的主要环境为：
+
+```text
+Ubuntu
+Python 3.8
+NVIDIA GPU
+Isaac Gym Preview 4
+PyTorch 2.4.1 + CUDA 12.1
+NumPy 1.23.5
+```
+
+Isaac Gym 和 PyTorch 需要根据本机驱动单独安装。项目的基础 Python 依赖可通过：
+
+```bash
+cd walk-these-ways-go2-main
 pip install -e .
 ```
 
-Start training: 
-```bash
-python scripts/train.py
-```
-
-`go2_gym` and `go2_gym_learn` folders are the main folders for training process.
-
-Play the model:
-```bash
-cd scripts
-python play.py
-```
-![Alt text](media/go2_training.jpg)
-
-Go2 pretrained model is provided in [./runs](runs/gait-conditioned-agility/pretrain-go2), you can choose whether to use provide pretrained model by modifying the label line `label = "gait-conditioned-agility/pretrain-go2/train"` to your own trained model.
-
-### Known Issues
-* `flip_visual_attachments` in [go2_config](go2_gym/envs/go2/go2_config.py) should be set to `True`, otherwise errors would occur when visualizing.
-* To change configuration parameters of env or the robot, you should modify parameters in [go2_config](go2_gym/envs/go2/go2_config.py), not in [legged_robot_config](go2_gym/envs/base/legged_robot_config.py)
-
-
----
-## Deploy on PC
-Trained policy is only supported to be deployed through your PC or laptop now, because I am not familiar with Jetson Orin, and hope I can fix it and deploy on Jetson Orin.
-
-### Requirements
-#### Install LCM
-Since [walk-these-ways](https://github.com/Improbable-AI/walk-these-ways) implement an interface based on Lightweight Communications and Marshalling ([LCM](https://github.com/lcm-proj/lcm)) to pass sensor data, motor commands, and joystick state between their code and the low-level control SDK provided by Unitree, LCM should be installed firstly in your PC or laptlop.
-
-Clone LCM repository to any location (where you usually place installed softwares), then install LCM:
-```bash
-git clone https://github.com/lcm-proj/lcm.git
-mkdir build
-cd build
-cmake ..
-make
-sudo make install
-```
-
-#### Unitree_SDK2
-unitree_sdk2 has been inclued in `go2_gym_deploy/unitree_sdk2_bin/library/unitree_sdk2`,  you can also clone from [Unitree Robotics](https://github.com/unitreerobotics/unitree_sdk2) to make sure the sdk is updated version.
+验证环境：
 
 ```bash
-cd go2_gym_deploy/unitree_sdk2_bin/library/unitree_sdk2
-```
-Delete build file
-```bash
-rm -r build
-```
-Install and build:
-```bash
-sudo ./install.sh
-mkdir build
-cd build
-cmake ..
-make
+python -c "import numpy, torch; print(numpy.__version__, torch.__version__)"
+python -c "import isaacgym; print('Isaac Gym import OK')"
 ```
 
-### Build lcm_position_go2
-`go2_gym_deploy/unitree_sdk2_bin/lcm_position_go2.cpp` is the core file of this project, which is similar to `lcm_position.cpp` in [walk-these-ways](https://github.com/Improbable-AI/walk-these-ways), but replace unitree_legged_sdk with unitree_sdk2.
+由于 `runs/` 不上传 GitHub，仓库不包含训练输出和完整模型检查点。运行高层训练前，
+需要先训练或取得兼容的 WTW Go2 底层模型，并放到：
 
-Build lcm_position_go2 and generate runfile `lcm_position_go2`
-```bash
-cd go2_gym_deploy
-rm -r build
-mkdir build
-cd build
-cmake ..
-make -j
+```text
+runs/gait-conditioned-agility/pretrain-go2/train/<run-id>/
 ```
 
-All LCM messages files in `go2_gym_deploy/lcm_types` are set as the same format shown in [walk-these-ways](https://github.com/Improbable-AI/walk-these-ways) to ensure successful connection with python files. LCM message files are provided in this project, and you can also generate customized LCM message files through the following instructions: 
+其中至少应包含：
 
-`xxx_lcmt.hpp` files are generated by:
-```bash
-lcm-gen -x xxx.lcm
+```text
+parameters.pkl
+checkpoints/body_latest.jit
+checkpoints/adaptation_module_latest.jit
 ```
 
-### Verify connection
-Connect your PC/Laptop with Go2 robot with ethernet cable and check connection by:
-```bash
-ping 192.168.123.161
-```
+## 最小主线用法
 
-Check the network interface address, and copy the network interface address.
-```bash
-ifconfig
-```
-If error occurs, please check [Unitree Support](https://support.unitree.com/home/zh/developer/Quick_start) for details.
+以下命令都从项目根目录执行。
 
-### Test communication between LCM and unitree_sdk2
-You can verify LCM send by opening a new terminal:
-```bash
-cd go2_gym_deploy/build
-sudo ./lcm_receive
-```
-
-If LCM and unitree_sdk2 are correctly connected with each other, messages will be shown in the terminal:
-
-![Alt text](media/lcm_receive.png)
-
-### Start LCM
-Before starting LCM, ensure that lcm_receive has been properly shut down. 
-**It's important not to run lcm_receive and lcm_position_go2 simultaneously.**
+### 第一阶段：只训练步态选择
 
 ```bash
-cd go2_gym_deploy/build
-sudo ./lcm_position_go2 eth0
-```
-Replace `eth0` with your own network interface address. According to the messages shown in terminal, press `Enter` for several times and the communication between LCM and unitree_sdk2 will set up.
-
-This command will automatically shut down Unitree sport_mode Service and set the robot to LOW-LEVEL. Please make sure This will Go2 is hung up or lie on the ground.
-
-
-### Load and run policy
-Open a new terminate and run:
-```bash
-cd go2_gym_deploy/scripts
-python deploy_policy.py
-```
-According to the hints shown in terminal, Press button [R2] to start the controller. You can check RC mapping in the following subsection.
-
-
-### Joystick Mapping
-
-![Joystick Mapping](media/rc_map.png)
-
-
-To view the details of joystick mapping or even modify default mapping logic, please refer to the `get_command` function within the [cheetah_state_estimator.py](go2_gym_deploy/utils/cheetah_state_estimator.py) file. In this project, the default gait is set to trot.
-
-
-**Caution**:
-* Press [L2+B] to switch to damping mode if any unexpected situation occurs!!!
-* This is research code; use at your own risk; we do not take responsibility for any damage.
-
-Test Video on Unitree Go2: 
-- Test in my bedroom: https://www.bilibili.com/video/BV1tQ4y1c7ZG/?spm_id_from=333.999.0.0&vd_source=07873ebe2a113dac57775e264a210929
-- Test by other contributors: https://www.bilibili.com/video/BV1Ut421H7Fr/?spm_id_from=333.1007.top_right_bar_window_history.content.click&vd_source=07873ebe2a113dac57775e264a210929
-
-
----
-## Deploy on Nvidia Jetson Orin
-
-The Unitree Go2 robot is equipped with an onboard Nvidia Jetson Orin Nano/NX, which operates on an ARM-based architecture. Default information of this onboard computer is shown below, and you can connnect to Jetson by SSH, VScode(remote development) or plugging a HDMI cable.
-
-```
-IP:192.168.123.18
-user name：unitree
-password：123
+PYTHONPATH=$PWD python3 -m high_level_minimal.train \
+  --run-name minimal_gait_stage \
+  --stage gait \
+  --decision-interval 5 \
+  --iterations 50
 ```
 
-### Requirements for Jetson
-- cuda
-- pytorch
-- miniconda (Omitted here; please install it by yourself)
-- cudnn (Omitted here; please install it by yourself)
+连续参数在这一阶段固定为默认值，避免随机参数探索干扰步态选择。
 
-
-Two different ways are provided to set up correct environments in Jetson: through Internet or through Docker.
-
-### Through Internet
-Connecting a Nvidia Jetson device to the internet can be done in two primary ways:
-
-1. **Wired Connection**: Directly plug an Ethernet cable with internet access into the Jetson's Ethernet port. This method provides a stable and fast internet connection, suitable for tasks that require high bandwidth or low latency.
-
-2. **Wireless Connection via USB Wi-Fi Adapter**: Purchase a USB Wi-Fi adapter compatible with the Jetson device. This method adds wireless connectivity, offering the flexibility to connect to the internet without the need for physical cables. However, it's important to ensure the USB Wi-Fi adapter is supported by the Jetson's operating system and drivers.
-
-
-
-#### Check Jetpack Version
-Jetpack toolbox has been preinstalled on Jetson, you should check the jetpack vertsion firstly.
-```bash
-sudo -H pip install jetson-stats  #Install jetson-stats toolkit
-sudo jtop
-```
-According to the detail information printed in the terminal window, the Jetpack version of my Unitree Go2 is `Jetpack 5.1.1 [L4T 35.3.1]`
-
-![](media/sudo_jtop.png)
-
-You can also check libraries that have been preinstalled: 
-```bash
-sudo jetson_release
-```
-#### Install cuda for jetson
-Check if there is a preinstalled version of cuda. 
-```bash
-nvcc -V # check preinstalled cuda version
-```
-
-If the preinstalled version if too high, you should uninstall it because, for instance, there is no Pytorch version that is compatible with cuda-12.2.
+### 第二阶段：小范围调整连续参数
 
 ```bash
-sudo apt-get remove cuda
-sudo apt autoremove 
-sudo apt-get remove cuda*
-sudo dpkg -l |grep cuda # check if any residual cuda file exists
-sudo dpkg -P Residual filename
+PYTHONPATH=$PWD python3 -m high_level_minimal.train \
+  --run-name minimal_parameter_stage \
+  --stage parameters \
+  --init-checkpoint runs/high_level_oracle_gait/minimal_gait_stage/checkpoints/high_level_final.pt \
+  --decision-interval 5 \
+  --iterations 30
 ```
 
-Personally, I recommend to install cuda-11.8. Click the link, [CUDA Toolkit 11.8 Downloads](https://developer.nvidia.com/cuda-11-8-0-download-archive?target_os=Linux&target_arch=aarch64-jetson&Compilation=Native&Distribution=Ubuntu&target_version=20.04&target_type=deb_local) , to check installation commands.
+第二阶段冻结步态选择、教师、学生和物理状态预测，只允许连续参数网络在默认模板
+附近调整。当前实验尚未证明该阶段能稳定提高性能。
 
-#### Install Pytorch for Jetson
+### 独立评测
 
-Please [download](https://forums.developer.nvidia.com/t/pytorch-for-jetson/72048) pre-built PyTorch pip wheel installers for Jetson Nano, which is different from the way we install Pytorch on PC. Note that correct pytorch version should be chosen to make it compatible with specific version of cuda and Jetpack. 
+```bash
+PYTHONPATH=$PWD python3 -m high_level_minimal.evaluate \
+  --run-dir runs/high_level_oracle_gait/minimal_gait_stage \
+  --eval flat_trot_efficiency:1.0,ramp_up_trot_robustness:1.0
+```
 
-#### Run codes without cable
-As long as the environment and requirements on the Jetson are properly configured, you can follow the same deployment guidelines as you would on a PC. This liberates the robot! Now, you can test the code cable-free, offering more freedom to the robot's movements and applications.
+固定小跑对照：
 
-### Through Docker
+```bash
+PYTHONPATH=$PWD python3 -m high_level_minimal.evaluate \
+  --run-dir runs/high_level_oracle_gait/minimal_gait_stage \
+  --eval flat_trot_efficiency:1.0,ramp_up_trot_robustness:1.0 \
+  --force-gait trotting
+```
 
-To be continue ...
+完整参数说明见
+[`high_level_minimal/README.md`](high_level_minimal/README.md)。
 
---- 
+## 仓库结构
 
-🌟🌟🌟  **Please star this repository if it does help you! Many Thanks!** 🌟🌟🌟 
+```text
+high_level_minimal/   当前高层主线的可读最小实现
+scripts/              历史训练、诊断和评测工具
+go2_gym/              Go2 仿真环境、奖励和基础封装
+go2_gym_learn/        底层强化学习基础设施
+go2_gym_deploy/       Go2 实机部署与 Unitree SDK2 接口
+resources/            机器人、地形和纹理资源
+reports/              精选汇报图、说明和视频
+runs/                 本地训练输出，不上传 GitHub
+logs/                 本地底层训练日志，不上传 GitHub
+```
 
+## 已知局限
 
----
-## Acknowledgements
-* Many thanks to [Leolar](https://github.com/NihaoyaLeolar), who provide Nvidia 3060ti and supporting.
-* Many thanks to [Jony](https://github.com/jonyzhang2023) and Peter for their support and encourage me to learn basic kownledge about RL.
-* Many thanks to [Simonforyou](https://github.com/Simonforyou), who provide Go2 pretrained model.
+- 当前可靠证据主要来自平地和上坡；
+- 未证明所有合理场景都需要离散步态切换；
+- 连续参数自适应尚无稳定收益；
+- 只有一个主要训练随机种子的完整结论；
+- GPU PhysX 不是严格确定性的；
+- 精选视频用于展示场景，不能代替多环境统计结果；
+- 奖励是一套经过审查的候选物理定义，而不是普遍真值；
+- 尚未完成延迟、噪声、传感器偏差和真实机器人验证。
 
----
-## TO DO
-- [x] Do not inherit config and env from go1_gym, build customized config and env files for Go2
-- [x] Deploy on Jeston Orin Nano
-- [ ] Deploy through Docker
+## 安全提示
+
+实机部署会直接向机器人发送低层关节命令。首次测试必须将机器人吊起或放置在
+安全支架上，准备随时切换阻尼模式，并确认网络接口、关节顺序、控制频率和急停
+逻辑。研究代码按现状提供，使用者需自行承担硬件风险。
+
+## 上游项目与许可证
+
+本项目基于：
+
+- [walk-these-ways](https://github.com/Improbable-AI/walk-these-ways)
+- [walk-these-ways-go2](https://github.com/Teddy-Liao/walk-these-ways-go2)
+- [legged_gym](https://github.com/leggedrobotics/legged_gym)
+- [rsl_rl](https://github.com/leggedrobotics/rsl_rl)
+- [Unitree SDK2](https://github.com/unitreerobotics/unitree_sdk2)
+
+请同时遵守根目录 `LICENSE`、`LICENSES/` 以及各第三方目录中的许可证。
