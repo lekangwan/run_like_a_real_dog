@@ -1,3 +1,9 @@
+"""高层策略训练入口。
+
+使用方法：第一阶段 ``--stage gait`` 固定连续参数，只学习步态和学生条件表征；
+第二阶段 ``--stage parameters`` 从第一阶段检查点开始，冻结步态信息通路后微调连续参数。
+"""
+
 import argparse
 import csv
 import json
@@ -5,7 +11,7 @@ import random
 
 import isaacgym
 
-assert isaacgym
+# Isaac Gym 必须先于 PyTorch 导入，才能正确加载其二进制扩展。
 import numpy as np
 import torch
 
@@ -14,17 +20,24 @@ from .config import (
     DEFAULT_TASKS,
     LOW_LEVEL_LABEL,
     RUNS_DIR,
-    TASK_MAP,
     validate_decision_interval,
 )
 from .environment import HighLevelEnvironment
 from .low_level import find_run
 from .model import HighLevelPolicy
 from .ppo import PPO, RolloutBuffer
-from .tasks import read_task_specs
+from .tasks import task_specs
 
 
 def parse_args():
+    """解析最小主线训练参数。
+
+    输入：进程命令行参数。
+    输出：``argparse.Namespace``，包含运行名、种子、迭代数、环境数、轨迹长度、
+    决策周期、任务集合、训练阶段、可选初始化检查点和渲染开关。
+    内部逻辑：只注册当前两阶段主线真正使用的选项，不暴露历史消融参数。
+    作用：为可重复训练提供清晰入口，同时减少误配置空间。
+    """
     parser = argparse.ArgumentParser(description="Minimal standalone high-level training.")
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--seed", type=int, default=1)
@@ -40,6 +53,12 @@ def parse_args():
 
 
 def set_seed(seed):
+    """同步所有随机数生成器。
+
+    输入：整数随机种子。输出：无显式返回。
+    内部逻辑：依次设置 Python、NumPy、PyTorch CPU；CUDA 可用时设置全部 GPU。
+    作用：让相同命令尽可能复现实验，便于多随机种子比较。
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -48,6 +67,13 @@ def set_seed(seed):
 
 
 def teacher_fraction(iteration, total_iterations, stage):
+    """计算当前迭代中教师隐变量的使用比例。
+
+    输入：当前迭代、总迭代数和训练阶段。
+    输出：``0.0`` 到 ``1.0`` 的浮点数 ``alpha``。
+    内部逻辑：参数阶段始终为零；步态阶段前 25% 为 1，中间 50% 线性降到 0，最后保持 0。
+    作用：先利用信息充分的教师稳定策略，再逐渐过渡到最终部署所需的学生。
+    """
     if stage == "parameters":
         return 0.0
     progress = iteration / max(1, total_iterations - 1)
@@ -59,6 +85,13 @@ def teacher_fraction(iteration, total_iterations, stage):
 
 
 def save_checkpoint(path, model, optimizer, iteration, run_config):
+    """保存可恢复训练与评测的检查点。
+
+    输入：输出路径、模型、优化器、当前迭代和运行配置字典。
+    输出：无显式返回；在磁盘写入一个 ``.pt`` 文件。
+    内部逻辑：确保父目录存在，再保存模型/优化器状态、迭代号和最小配置。
+    作用：支持第二阶段初始化、独立评测和中断后的状态追溯。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -72,6 +105,13 @@ def save_checkpoint(path, model, optimizer, iteration, run_config):
 
 
 def append_metrics(path, row):
+    """逐迭代追加训练指标。
+
+    输入：CSV 路径和键值结构一致的一行指标字典。
+    输出：无显式返回；在磁盘创建或追加 CSV。
+    内部逻辑：依据文件是否存在决定是否写表头，再按字典键顺序写入。
+    作用：记录奖励、误差、损失和步态比例，供训练后分析而不依赖终端日志。
+    """
     write_header = not path.exists()
     with open(path, "a", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=row.keys())
@@ -81,6 +121,23 @@ def append_metrics(path, row):
 
 
 def collect_rollout(env, model, args, alpha):
+    """采集一批在线轨迹，并把持续执行期间的奖励归于同一个步态决策。
+
+    输入：
+        env: ``HighLevelEnvironment``。
+        model: 当前 ``HighLevelPolicy``。
+        args: 包含轨迹决策数、保持周期和训练阶段。
+        alpha: 教师隐变量混合比例。
+    输出：
+        buffer: 已计算回报与优势的 ``RolloutBuffer``。
+        metrics: 平均奖励、终止率、速度误差和四种步态比例。
+    内部逻辑：
+        每个决策点采集教师/学生隐变量混合状态并采样动作；同一动作连续执行
+        ``decision_interval`` 个 0.1 秒步，将折扣奖励累积到该动作；轨迹末端估计价值，
+        按持续周期修正折扣因子并计算 GAE。
+    作用：
+        让 PPO 学习“某步态持续一段时间后的效果”，而非只看切换瞬间的噪声。
+    """
     device = env.device
     selector_only = args.stage == "gait"
     augmented_dim = env.policy_obs_dim + model.latent_dim
@@ -99,6 +156,7 @@ def collect_rollout(env, model, args, alpha):
     gait_counts = torch.zeros(env.num_gaits, device=device)
 
     for _ in range(args.rollout_decisions):
+        # 教师只参与训练；随着 alpha 降低，策略逐步切换为学生隐变量。
         privileged = env.privileged_observation()
         history = observation[:, : env.base_obs_dim]
         with torch.inference_mode():
@@ -111,6 +169,7 @@ def collect_rollout(env, model, args, alpha):
         option_reward = torch.zeros(env.num_envs, device=device)
         option_done = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
         active = torch.ones_like(option_done)
+        # 同一组高层步态指令保持 decision_interval 个 0.1 秒步，减少瞬时奖励噪声。
         for substep in range(args.decision_interval):
             next_observation, reward, done, _ = env.step(action)
             option_reward += (0.99**substep) * reward * active.float()
@@ -122,6 +181,7 @@ def collect_rollout(env, model, args, alpha):
             vx_error_total += torch.abs(env.measured_vx() - env.command_vx()).mean().item()
             observation = next_observation
 
+        # 折扣后的整段回报与该段起点的动作绑定，形成一个 PPO 转移。
         buffer.add(
             augmented.detach(),
             privileged.detach(),
@@ -142,6 +202,7 @@ def collect_rollout(env, model, args, alpha):
         latent = alpha * teacher + (1.0 - alpha) * student
         last_obs = model.augment_observation(observation, latent)
         last_value = model.critic(last_obs).squeeze(-1)
+    # 一个缓存步跨越多个物理高层步，因此折扣因子也要提升相同次幂。
     buffer.finish(last_value, 0.99**args.decision_interval, 0.95)
     env.current_observation = observation
 
@@ -155,6 +216,15 @@ def collect_rollout(env, model, args, alpha):
 
 
 def main():
+    """组装环境、模型和 PPO，执行指定阶段训练并保存结果。
+
+    输入：来自 ``parse_args`` 的命令行参数，以及内置任务目录、底层检查点等仓库资源。
+    输出：无 Python 返回值；生成运行配置、训练指标 CSV 和最终模型检查点。
+    内部逻辑：
+        验证周期和阶段依赖，设置种子，读取任务并创建环境；构造或恢复模型，配置阶段；
+        循环执行轨迹采样与 PPO 更新，记录日志，最后保存检查点。
+    作用：高层最小实现的唯一训练入口，完整串起两阶段主线。
+    """
     args = parse_args()
     validate_decision_interval(args.decision_interval)
     if args.stage == "parameters" and not args.init_checkpoint:
@@ -162,7 +232,7 @@ def main():
     set_seed(args.seed)
 
     task_ids = tuple(item.strip() for item in args.tasks.split(",") if item.strip())
-    specs = read_task_specs(TASK_MAP, task_ids)
+    specs = task_specs(task_ids)
     low_level_run = find_run(LOW_LEVEL_LABEL)
     env = HighLevelEnvironment(specs, low_level_run, args.num_envs, render=args.render)
     env.current_observation = env.reset()
@@ -172,11 +242,11 @@ def main():
         base_obs_dim=env.base_obs_dim,
         num_gaits=env.num_gaits,
         residual_dim=env.action_dim - env.num_gaits,
-        use_gait_input_residuals=args.stage == "parameters",
     ).to(env.device)
     if args.init_checkpoint:
         checkpoint = torch.load(args.init_checkpoint, map_location=env.device)
-        model.load_state_dict(checkpoint["model"], strict=False)
+        model.load_state_dict(checkpoint["model"])
+    # 阶段配置决定连续步态参数是否开放，以及哪些子网络允许更新。
     model.set_stage(args.stage)
     trainer = PPO(model, args.stage)
 
