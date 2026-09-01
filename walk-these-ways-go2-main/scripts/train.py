@@ -1,20 +1,6 @@
-def train_go2(headless=True):
-
-    import isaacgym
-    assert isaacgym
-    import torch
-
-    from go2_gym.envs.base.legged_robot_config import Cfg
+def configure_go2_training(Cfg):
+    """Apply the original WTW Go2 training configuration to ``Cfg``."""
     from go2_gym.envs.go2.go2_config import config_go2
-    from go2_gym.envs.go2.velocity_tracking import VelocityTrackingEasyEnv
-
-    from ml_logger import logger
-
-    from go2_gym_learn.ppo_cse import Runner
-    from go2_gym.envs.wrappers.history_wrapper import HistoryWrapper
-    from go2_gym_learn.ppo_cse.actor_critic import AC_Args
-    from go2_gym_learn.ppo_cse.ppo import PPO_Args
-    from go2_gym_learn.ppo_cse import RunnerArgs
 
     config_go2(Cfg)
 
@@ -204,6 +190,21 @@ def train_go2(headless=True):
     Cfg.commands.pacing_offset = False
     Cfg.commands.binary_phases = True
     Cfg.commands.gaitwise_curricula = True
+
+
+def train_go2(headless=True):
+    import isaacgym
+    assert isaacgym
+
+    from go2_gym.envs.base.legged_robot_config import Cfg
+    from go2_gym.envs.go2.velocity_tracking import VelocityTrackingEasyEnv
+    from go2_gym.envs.wrappers.history_wrapper import HistoryWrapper
+    from go2_gym_learn.ppo_cse import Runner, RunnerArgs
+    from go2_gym_learn.ppo_cse.actor_critic import AC_Args
+    from go2_gym_learn.ppo_cse.ppo import PPO_Args
+    from ml_logger import logger
+
+    configure_go2_training(Cfg)
 
     env = VelocityTrackingEasyEnv(sim_device='cuda:0', headless=False, cfg=Cfg)
 

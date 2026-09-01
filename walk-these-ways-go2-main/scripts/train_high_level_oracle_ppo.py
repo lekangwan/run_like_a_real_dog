@@ -563,6 +563,7 @@ class OracleConditionHighLevelEnv:
         teleport_thresh=TRAIN_TELEPORT_THRESH,
         mesh_type=TRAIN_MESH_TYPE,
         selector_hold_steps=3,
+        high_level_dt=0.10,
         terrain_length=None,
         terrain_width=None,
         recording_width_px=None,
@@ -592,6 +593,7 @@ class OracleConditionHighLevelEnv:
         self.env = HighLevelGaitWrapper(
             low_env,
             low_policy,
+            high_level_dt=high_level_dt,
             record_reward_terms=True,
             selector_reference_coef=0.0,
             selector_hold_steps=selector_hold_steps,

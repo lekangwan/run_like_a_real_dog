@@ -61,7 +61,7 @@ class RunnerArgs(PrefixProto, cli=False):
 
 class Runner:
 
-    def __init__(self, env, device='cpu'):
+    def __init__(self, env, device='cpu', local_checkpoint=None):
         from .ppo import PPO
 
         self.device = device
@@ -72,6 +72,13 @@ class Runner:
                                       self.env.num_obs_history,
                                       self.env.num_actions,
                                       ).to(self.device)
+
+        if local_checkpoint is not None:
+            weights = torch.load(local_checkpoint, map_location=self.device)
+            if isinstance(weights, dict) and "state_dict" in weights:
+                weights = weights["state_dict"]
+            actor_critic.load_state_dict(weights)
+            print(f"Loaded local actor-critic checkpoint: {local_checkpoint}")
 
         if RunnerArgs.resume:
             # load pretrained weights from resume_path

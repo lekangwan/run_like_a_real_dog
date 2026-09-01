@@ -1,5 +1,6 @@
 import argparse
 import csv
+import random
 import time
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import isaacgym
 
 assert isaacgym
 from isaacgym import gymtorch
+import numpy as np
 import torch
 
 from gait_project_config import (
@@ -107,11 +109,74 @@ def parse_eval_item(text, specs):
     return by_task[task_id], vx
 
 
-def fixed_action(env, gait_name):
+def parse_residuals(text):
+    values = tuple(float(value.strip()) for value in text.split(","))
+    if len(values) != 5:
+        raise argparse.ArgumentTypeError(
+            "Expected five comma-separated residuals: "
+            "frequency,duration,footswing,stance_width,body_pitch"
+        )
+    if any(value < -1.0 or value > 1.0 for value in values):
+        raise argparse.ArgumentTypeError("Every residual must be within [-1, 1]")
+    return values
+
+
+def parse_initial_phase(text):
+    normalized = text.strip().lower()
+    if normalized in ("preserve", "none"):
+        return None
+    value = float(normalized)
+    if value < 0.0 or value >= 1.0:
+        raise argparse.ArgumentTypeError(
+            "Initial gait phase must be within [0, 1), or use 'preserve'"
+        )
+    return value
+
+
+def phase_label(phase):
+    return "preserve" if phase is None else f"{phase:.2f}"
+
+
+def fixed_action(env, gait_name, residuals):
     gait_id = GAIT_NAMES.index(gait_name)
     action = torch.zeros(env.num_envs, env.num_high_level_actions, device=env.device)
     action[:, gait_id] = 1.0
+    residual_start = len(GAIT_NAMES)
+    residual_end = residual_start + len(residuals)
+    if residual_end > action.shape[1]:
+        raise ValueError(
+            f"Action has {action.shape[1]} dimensions, but gait plus residuals "
+            f"requires {residual_end}"
+        )
+    action[:, residual_start:residual_end] = torch.tensor(
+        residuals,
+        device=env.device,
+        dtype=action.dtype,
+    )
     return action
+
+
+def set_initial_gait_phase(env, phase):
+    if phase is None:
+        return
+    base = env.env._get_base_env()
+    base.gait_indices.fill_(phase)
+
+
+def set_gait_template_transition(env, source_gait, target_gait, step, transition_steps):
+    high = env.env
+    if transition_steps <= 0 or step >= transition_steps:
+        high.set_gait_command_override(None)
+        return
+    source_id = GAIT_NAMES.index(source_gait)
+    target_id = GAIT_NAMES.index(target_gait)
+    alpha = float(step + 1) / float(transition_steps)
+    gait_command = torch.lerp(
+        high.gait_templates[source_id],
+        high.gait_templates[target_id],
+        alpha,
+    )
+    high.set_gait_command_override(gait_command.unsqueeze(0).expand(env.num_envs, -1))
 
 
 def set_fixed_vx(env, vx):
@@ -243,8 +308,45 @@ def finalize_metric_tensors(stats):
     return output
 
 
-def run_fixed_gait(env, gait_name, vx, steps, warmup_steps, gamma, time_bin_steps=0):
-    action = fixed_action(env, gait_name)
+def run_fixed_gait(
+    env,
+    gait_name,
+    residuals,
+    vx,
+    steps,
+    warmup_steps,
+    gamma,
+    time_bin_steps=0,
+    initial_phase=None,
+    transition_from_gait=None,
+    transition_from_residuals=None,
+    template_transition_steps=0,
+    contact_aware_switch=False,
+    contact_switch_min_feet=3,
+    contact_switch_max_abs_vz=0.20,
+    contact_switch_max_wait_steps=5,
+    contact_switch_phase=0.0,
+):
+    set_initial_gait_phase(env, initial_phase)
+    target_action = fixed_action(env, gait_name, residuals)
+    source_action = fixed_action(
+        env,
+        transition_from_gait or gait_name,
+        transition_from_residuals or residuals,
+    )
+    switched = torch.full(
+        (env.num_envs,),
+        not contact_aware_switch,
+        dtype=torch.bool,
+        device=env.device,
+    )
+    switch_step = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
+    safe_trigger = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    forced_trigger = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    switch_contact_count = torch.full(
+        (env.num_envs,), -1.0, dtype=torch.float, device=env.device
+    )
+    switch_abs_vz = torch.full((env.num_envs,), -1.0, dtype=torch.float, device=env.device)
     stats = init_metric_tensors(env)
     bin_stats = init_metric_tensors(env) if time_bin_steps > 0 else None
     bin_outputs = []
@@ -256,6 +358,35 @@ def run_fixed_gait(env, gait_name, vx, steps, warmup_steps, gamma, time_bin_step
     # restores simulator tensors. Inference tensors reject later inplace restore.
     with torch.no_grad():
         for step in range(steps + warmup_steps):
+            if contact_aware_switch:
+                env.env.set_gait_command_override(None)
+                contacts = env.env._current_foot_contacts()
+                contact_count = contacts.sum(dim=1)
+                abs_vz = torch.abs(env.env._get_base_env().base_lin_vel[:, 2])
+                safe_now = (contact_count >= contact_switch_min_feet) & (
+                    abs_vz <= contact_switch_max_abs_vz
+                )
+                force_now = torch.full_like(safe_now, step >= contact_switch_max_wait_steps)
+                newly_switched = (~switched) & (safe_now | force_now)
+                if torch.any(newly_switched):
+                    switch_step[newly_switched] = step
+                    safe_trigger[newly_switched] = safe_now[newly_switched]
+                    forced_trigger[newly_switched] = ~safe_now[newly_switched]
+                    switch_contact_count[newly_switched] = contact_count[newly_switched].float()
+                    switch_abs_vz[newly_switched] = abs_vz[newly_switched]
+                    base = env.env._get_base_env()
+                    base.gait_indices[newly_switched] = contact_switch_phase
+                    switched |= newly_switched
+                action = torch.where(switched.unsqueeze(1), target_action, source_action)
+            else:
+                set_gait_template_transition(
+                    env,
+                    transition_from_gait or gait_name,
+                    gait_name,
+                    step,
+                    template_transition_steps,
+                )
+                action = target_action
             set_fixed_vx(env, vx)
             _obs, reward, done, info = env.step(action)
             set_fixed_vx(env, vx)
@@ -283,16 +414,23 @@ def run_fixed_gait(env, gait_name, vx, steps, warmup_steps, gamma, time_bin_step
                         )
                         bin_start_step = eval_step + 1
                         bin_stats = init_metric_tensors(env)
+    env.env.set_gait_command_override(None)
     output = finalize_metric_tensors(stats)
     output["ppo_option_return"] = ppo_option_return
     output["ppo_active_steps"] = ppo_active_steps
+    if contact_aware_switch:
+        output["transition_switch_step"] = switch_step.float()
+        output["transition_safe_trigger"] = safe_trigger.float()
+        output["transition_forced_trigger"] = forced_trigger.float()
+        output["transition_contact_count"] = switch_contact_count
+        output["transition_abs_vz"] = switch_abs_vz
     return output, bin_outputs
 
 
-def context_rollout(env, gait_name, vx, steps):
+def context_rollout(env, gait_name, residuals, vx, steps):
     if steps <= 0:
         return
-    action = fixed_action(env, gait_name)
+    action = fixed_action(env, gait_name, residuals)
     # Keep restored env tensors writable; see run_fixed_gait.
     with torch.no_grad():
         for _ in range(steps):
@@ -388,14 +526,31 @@ def write_summary(path, args, spec, vx, delta_rows):
     lines = [
         "# Paired Fixed-Gait Live Reward Audit",
         "",
+        f"- low_level_run_dir: `{args.resolved_low_level_run_dir}`",
         f"- task: `{spec.task_id}`",
         f"- condition: `{spec.condition}`",
         f"- vx: `{vx:.2f}`",
         f"- gait_a: `{args.gait_a}`",
+        f"- gait_a_residuals: `{','.join(str(value) for value in args.gait_a_residuals)}`",
+        f"- gait_a_initial_phase: `{phase_label(args.gait_a_initial_phase)}`",
+        f"- gait_a_template_transition_steps: `{args.gait_a_template_transition_steps}`",
+        f"- gait_a_contact_aware_switch: `{args.gait_a_contact_aware_switch}`",
         f"- gait_b: `{args.gait_b}`",
+        f"- gait_b_residuals: `{','.join(str(value) for value in args.gait_b_residuals)}`",
+        f"- gait_b_initial_phase: `{phase_label(args.gait_b_initial_phase)}`",
+        f"- gait_b_template_transition_steps: `{args.gait_b_template_transition_steps}`",
+        f"- gait_b_contact_aware_switch: `{args.gait_b_contact_aware_switch}`",
         f"- delta: `{args.gait_a} - {args.gait_b}`",
         f"- context_gait: `{args.context_gait}`",
+        f"- context_residuals: `{','.join(str(value) for value in args.context_residuals)}`",
         f"- context_steps: `{args.context_steps}`",
+        f"- high_level_dt: `{args.high_level_dt}`",
+        f"- contact_switch_min_feet: `{args.contact_switch_min_feet}`",
+        f"- contact_switch_max_abs_vz: `{args.contact_switch_max_abs_vz}`",
+        f"- contact_switch_max_wait_steps: `{args.contact_switch_max_wait_steps}`",
+        f"- contact_switch_phase: `{args.contact_switch_phase}`",
+        f"- branch_order: `{args.branch_order}`",
+        f"- seed: `{args.seed}`",
         "",
         "| metric | gait_a | gait_b | delta mean | delta median | delta std | P(delta>0) |",
         "|---|---:|---:|---:|---:|---:|---:|",
@@ -419,12 +574,100 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", default="gait-conditioned-agility/pretrain-go2/train")
     parser.add_argument("--run-index", type=int, default=0)
+    parser.add_argument(
+        "--low-level-run-dir",
+        default=None,
+        help=(
+            "Load parameters.pkl and exported low-level policy modules from this "
+            "run directory instead of resolving --label/--run-index."
+        ),
+    )
     parser.add_argument("--task-map", default=str(MAINLINE_TASK_MAP))
     parser.add_argument("--eval", default=DEFAULT_EVAL)
     parser.add_argument("--gait-a", default="pronking", choices=GAIT_NAMES)
     parser.add_argument("--gait-b", default="trotting", choices=GAIT_NAMES)
+    parser.add_argument(
+        "--gait-a-residuals",
+        type=parse_residuals,
+        default=parse_residuals("0,0,0,0,0"),
+    )
+    parser.add_argument(
+        "--gait-b-residuals",
+        type=parse_residuals,
+        default=parse_residuals("0,0,0,0,0"),
+    )
+    parser.add_argument(
+        "--gait-a-initial-phase",
+        type=parse_initial_phase,
+        default=None,
+        metavar="PHASE|preserve",
+        help=(
+            "Set the base gait clock once before gait A starts. "
+            "Use a value in [0, 1), or preserve the context clock (default)."
+        ),
+    )
+    parser.add_argument(
+        "--gait-b-initial-phase",
+        type=parse_initial_phase,
+        default=None,
+        metavar="PHASE|preserve",
+        help=(
+            "Set the base gait clock once before gait B starts. "
+            "Use a value in [0, 1), or preserve the context clock (default)."
+        ),
+    )
+    parser.add_argument(
+        "--gait-a-template-transition-steps",
+        type=int,
+        default=0,
+        help=(
+            "Interpolate gait phase/offset/bound from the context gait to gait A "
+            "over this many high-level steps; 0 keeps the immediate switch."
+        ),
+    )
+    parser.add_argument(
+        "--gait-b-template-transition-steps",
+        type=int,
+        default=0,
+        help=(
+            "Interpolate gait phase/offset/bound from the context gait to gait B "
+            "over this many high-level steps; 0 keeps the immediate switch."
+        ),
+    )
+    parser.add_argument("--gait-a-contact-aware-switch", action="store_true")
+    parser.add_argument("--gait-b-contact-aware-switch", action="store_true")
+    parser.add_argument("--contact-switch-min-feet", type=int, default=3)
+    parser.add_argument("--contact-switch-max-abs-vz", type=float, default=0.20)
+    parser.add_argument("--contact-switch-max-wait-steps", type=int, default=5)
+    parser.add_argument(
+        "--contact-switch-phase",
+        type=parse_initial_phase,
+        default=0.0,
+        metavar="PHASE",
+    )
     parser.add_argument("--context-gait", default="trotting", choices=GAIT_NAMES)
+    parser.add_argument(
+        "--context-residuals",
+        type=parse_residuals,
+        default=None,
+        help="Defaults to --gait-b-residuals.",
+    )
     parser.add_argument("--context-steps", type=int, default=20)
+    parser.add_argument(
+        "--high-level-dt",
+        type=float,
+        default=0.10,
+        help="Seconds per evaluator action/check step; training defaults to 0.10.",
+    )
+    parser.add_argument(
+        "--branch-order",
+        default="ab",
+        choices=("ab", "ba"),
+        help=(
+            "Order used after the shared context: 'ab' runs gait A first; "
+            "'ba' runs gait B first. Use both orders to diagnose simulator restore effects."
+        ),
+    )
     parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--steps", type=int, default=300)
@@ -470,7 +713,36 @@ def main():
     )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--render", action="store_true")
+    parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
+    if args.gait_a_template_transition_steps < 0 or args.gait_b_template_transition_steps < 0:
+        parser.error("Gait template transition steps must be non-negative")
+    if args.gait_a_contact_aware_switch and args.gait_a_template_transition_steps:
+        parser.error("Gait A cannot use contact-aware and interpolated switching together")
+    if args.gait_b_contact_aware_switch and args.gait_b_template_transition_steps:
+        parser.error("Gait B cannot use contact-aware and interpolated switching together")
+    if args.gait_a_contact_aware_switch and args.gait_a_initial_phase is not None:
+        parser.error("Use --contact-switch-phase instead of --gait-a-initial-phase")
+    if args.gait_b_contact_aware_switch and args.gait_b_initial_phase is not None:
+        parser.error("Use --contact-switch-phase instead of --gait-b-initial-phase")
+    if args.contact_switch_min_feet < 1 or args.contact_switch_min_feet > 4:
+        parser.error("--contact-switch-min-feet must be between 1 and 4")
+    if args.contact_switch_max_abs_vz < 0.0:
+        parser.error("--contact-switch-max-abs-vz must be non-negative")
+    if args.contact_switch_max_wait_steps < 0:
+        parser.error("--contact-switch-max-wait-steps must be non-negative")
+    if args.contact_switch_phase is None:
+        parser.error("--contact-switch-phase requires a numeric phase")
+    if args.high_level_dt <= 0.0:
+        parser.error("--high-level-dt must be positive")
+    if args.context_residuals is None:
+        args.context_residuals = args.gait_b_residuals
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     specs = read_task_specs(
         args.task_map,
@@ -486,7 +758,21 @@ def main():
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logdir = find_logdir(args.label, args.run_index)
+    if args.low_level_run_dir is None:
+        logdir = Path(find_logdir(args.label, args.run_index)).resolve()
+    else:
+        logdir = Path(args.low_level_run_dir).expanduser().resolve()
+        required_files = (
+            logdir / "parameters.pkl",
+            logdir / "checkpoints" / "body_latest.jit",
+            logdir / "checkpoints" / "adaptation_module_latest.jit",
+        )
+        missing = [str(path) for path in required_files if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(
+                "Low-level run directory is incomplete; missing: " + ", ".join(missing)
+            )
+    args.resolved_low_level_run_dir = str(logdir)
     low_policy = load_low_level_policy(logdir)
     env = OracleConditionHighLevelEnv(
         [spec],
@@ -500,6 +786,7 @@ def main():
         teleport_thresh=args.teleport_thresh,
         mesh_type=args.mesh_type,
         selector_hold_steps=args.selector_hold_steps,
+        high_level_dt=args.high_level_dt,
         terrain_length=args.terrain_length,
         terrain_width=args.terrain_width,
     )
@@ -510,29 +797,58 @@ def main():
         for repeat in range(args.repeats):
             env.reset()
             set_fixed_vx(env, vx)
-            context_rollout(env, args.context_gait, vx, args.context_steps)
+            context_rollout(
+                env,
+                args.context_gait,
+                args.context_residuals,
+                vx,
+                args.context_steps,
+            )
             state = snapshot_env(env)
 
-            restore_env(env, state)
-            result_a, bins_a = run_fixed_gait(
-                env,
-                args.gait_a,
-                vx,
-                args.steps,
-                args.warmup_steps,
-                args.gamma,
-                args.time_bin_steps,
-            )
-            restore_env(env, state)
-            result_b, bins_b = run_fixed_gait(
-                env,
-                args.gait_b,
-                vx,
-                args.steps,
-                args.warmup_steps,
-                args.gamma,
-                args.time_bin_steps,
-            )
+            branch_specs = {
+                "a": (
+                    args.gait_a,
+                    args.gait_a_residuals,
+                    args.gait_a_initial_phase,
+                    args.gait_a_template_transition_steps,
+                    args.gait_a_contact_aware_switch,
+                ),
+                "b": (
+                    args.gait_b,
+                    args.gait_b_residuals,
+                    args.gait_b_initial_phase,
+                    args.gait_b_template_transition_steps,
+                    args.gait_b_contact_aware_switch,
+                ),
+            }
+            branch_results = {}
+            for branch in args.branch_order:
+                gait_name, residuals, initial_phase, transition_steps, contact_switch = branch_specs[
+                    branch
+                ]
+                restore_env(env, state)
+                branch_results[branch] = run_fixed_gait(
+                    env,
+                    gait_name,
+                    residuals,
+                    vx,
+                    args.steps,
+                    args.warmup_steps,
+                    args.gamma,
+                    args.time_bin_steps,
+                    initial_phase,
+                    args.context_gait,
+                    args.context_residuals,
+                    transition_steps,
+                    contact_switch,
+                    args.contact_switch_min_feet,
+                    args.contact_switch_max_abs_vz,
+                    args.contact_switch_max_wait_steps,
+                    args.contact_switch_phase,
+                )
+            result_a, bins_a = branch_results["a"]
+            result_b, bins_b = branch_results["b"]
 
             metric_names = sorted(set(result_a) | set(result_b))
             for env_id in range(args.num_envs):
@@ -544,8 +860,17 @@ def main():
                     "cmd_vx": vx,
                     "gait_a": args.gait_a,
                     "gait_b": args.gait_b,
+                    "gait_a_initial_phase": phase_label(args.gait_a_initial_phase),
+                    "gait_b_initial_phase": phase_label(args.gait_b_initial_phase),
+                    "gait_a_template_transition_steps": args.gait_a_template_transition_steps,
+                    "gait_b_template_transition_steps": args.gait_b_template_transition_steps,
+                    "gait_a_contact_aware_switch": args.gait_a_contact_aware_switch,
+                    "gait_b_contact_aware_switch": args.gait_b_contact_aware_switch,
+                    "branch_order": args.branch_order,
+                    "first_branch": args.branch_order[0],
                     "context_gait": args.context_gait,
                     "context_steps": args.context_steps,
+                    "high_level_dt": args.high_level_dt,
                 }
                 for metric in metric_names:
                     if metric in result_a:
@@ -571,8 +896,17 @@ def main():
                         "cmd_vx": vx,
                         "gait_a": args.gait_a,
                         "gait_b": args.gait_b,
+                        "gait_a_initial_phase": phase_label(args.gait_a_initial_phase),
+                        "gait_b_initial_phase": phase_label(args.gait_b_initial_phase),
+                        "gait_a_template_transition_steps": args.gait_a_template_transition_steps,
+                        "gait_b_template_transition_steps": args.gait_b_template_transition_steps,
+                        "gait_a_contact_aware_switch": args.gait_a_contact_aware_switch,
+                        "gait_b_contact_aware_switch": args.gait_b_contact_aware_switch,
+                        "branch_order": args.branch_order,
+                        "first_branch": args.branch_order[0],
                         "context_gait": args.context_gait,
                         "context_steps": args.context_steps,
+                        "high_level_dt": args.high_level_dt,
                         "start_step": bin_a["start_step"],
                         "end_step": bin_a["end_step"],
                     }

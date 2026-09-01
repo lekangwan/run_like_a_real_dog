@@ -700,6 +700,16 @@ class LeggedRobot(BaseTask):
         sample_interval = int(self.cfg.commands.resampling_time / self.dt)
         env_ids = (self.episode_length_buf % sample_interval == 0).nonzero(as_tuple=False).flatten()
         self._resample_commands(env_ids)
+
+        gait_transition_interval_s = self.cfg.commands.gait_transition_interval_s
+        if gait_transition_interval_s > 0.0 and self.cfg.commands.num_commands >= 8:
+            gait_interval = max(1, int(round(gait_transition_interval_s / self.dt)))
+            gait_env_ids = torch.logical_and(
+                self.episode_length_buf > 0,
+                self.episode_length_buf % gait_interval == 0,
+            ).nonzero(as_tuple=False).flatten()
+            self._resample_gait_only(gait_env_ids)
+
         self._step_contact_targets()
 
         # measure terrain heights
@@ -731,28 +741,29 @@ class LeggedRobot(BaseTask):
         ep_len = min(self.cfg.env.max_episode_length, timesteps)
 
         # update curricula based on terminated environment bins and categories
-        for i, (category, curriculum) in enumerate(zip(self.category_names, self.curricula)):
-            env_ids_in_category = self.env_command_categories[env_ids.cpu()] == i
-            if isinstance(env_ids_in_category, np.bool_) or len(env_ids_in_category) == 1:
-                env_ids_in_category = torch.tensor([env_ids_in_category], dtype=torch.bool)
-            elif len(env_ids_in_category) == 0:
-                continue
+        if not self.cfg.commands.freeze_curriculum_updates:
+            for i, (category, curriculum) in enumerate(zip(self.category_names, self.curricula)):
+                env_ids_in_category = self.env_command_categories[env_ids.cpu()] == i
+                if isinstance(env_ids_in_category, np.bool_) or len(env_ids_in_category) == 1:
+                    env_ids_in_category = torch.tensor([env_ids_in_category], dtype=torch.bool)
+                elif len(env_ids_in_category) == 0:
+                    continue
 
-            env_ids_in_category = env_ids[env_ids_in_category]
+                env_ids_in_category = env_ids[env_ids_in_category]
 
-            task_rewards, success_thresholds = [], []
-            for key in ["tracking_lin_vel", "tracking_ang_vel", "tracking_contacts_shaped_force",
-                        "tracking_contacts_shaped_vel"]:
-                if key in self.command_sums.keys():
-                    task_rewards.append(self.command_sums[key][env_ids_in_category] / ep_len)
-                    success_thresholds.append(self.curriculum_thresholds[key] * self.reward_scales[key])
+                task_rewards, success_thresholds = [], []
+                for key in ["tracking_lin_vel", "tracking_ang_vel", "tracking_contacts_shaped_force",
+                            "tracking_contacts_shaped_vel"]:
+                    if key in self.command_sums.keys():
+                        task_rewards.append(self.command_sums[key][env_ids_in_category] / ep_len)
+                        success_thresholds.append(self.curriculum_thresholds[key] * self.reward_scales[key])
 
-            old_bins = self.env_command_bins[env_ids_in_category.cpu().numpy()]
-            if len(success_thresholds) > 0:
-                curriculum.update(old_bins, task_rewards, success_thresholds,
-                                  local_range=np.array(
-                                      [0.55, 0.55, 0.55, 0.55, 0.35, 0.25, 0.25, 0.25, 0.25, 1.0, 1.0, 1.0, 1.0, 1.0,
-                                       1.0]))
+                old_bins = self.env_command_bins[env_ids_in_category.cpu().numpy()]
+                if len(success_thresholds) > 0:
+                    curriculum.update(old_bins, task_rewards, success_thresholds,
+                                      local_range=np.array(
+                                          [0.55, 0.55, 0.55, 0.55, 0.35, 0.25, 0.25, 0.25, 0.25, 1.0, 1.0, 1.0, 1.0, 1.0,
+                                           1.0]))
 
         # assign resampled environments to new categories
         random_env_floats = torch.rand(len(env_ids), device=self.device)
@@ -838,6 +849,39 @@ class LeggedRobot(BaseTask):
         # reset command sums
         for key in self.command_sums.keys():
             self.command_sums[key][env_ids] = 0.
+
+    def _resample_gait_only(self, env_ids):
+        """Switch gait family while preserving velocity and continuous commands."""
+        if len(env_ids) == 0:
+            return
+
+        # Command dimensions 5 through 7 are phase, offset,
+        # and bound. The final row is the globally shifted pronk equivalent.
+        classifier_templates = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                [0.0, 0.5, 0.0],
+                [0.0, 0.0, 0.5],
+                [0.5, 0.5, 0.5],
+            ],
+            dtype=self.commands.dtype,
+            device=self.device,
+        )
+        classifier_family_ids = torch.tensor([0, 1, 2, 3, 0], device=self.device)
+
+        gait_commands = self.commands[env_ids, 5:8]
+        circular_delta = torch.abs(gait_commands.unsqueeze(1) - classifier_templates.unsqueeze(0))
+        circular_delta = torch.minimum(circular_delta, 1.0 - circular_delta)
+        nearest_template = torch.sum(circular_delta, dim=-1).argmin(dim=1)
+        current_family = classifier_family_ids[nearest_template]
+
+        # Adding one of 1, 2, or 3 modulo four guarantees a different family
+        # while keeping all three alternatives equally likely.
+        family_offset = torch.randint(1, 4, (len(env_ids),), device=self.device)
+        new_family = torch.remainder(current_family + family_offset, 4)
+        command_templates = classifier_templates[:4]
+        self.commands[env_ids, 5:8] = command_templates[new_family]
 
     def _step_contact_targets(self):
         if self.cfg.env.observe_gait_commands:

@@ -176,9 +176,11 @@ class HighLevelGaitWrapper:
         self.target_gait_ids = None
         self.selector_reference_coef_tensor = None
         self.task_reward_weights = None
+        self.gait_command_override = None
 
     def reset(self):
         self.low_level_obs = self.env.reset()
+        self.gait_command_override = None
         self.prev_foot_contacts = self._current_foot_contacts()
         self.high_level_action.copy_(self.default_high_level_action)
         self.prev_high_level_action.copy_(self.default_high_level_action)
@@ -207,6 +209,24 @@ class HighLevelGaitWrapper:
         if tuple(weights.shape) != expected_shape:
             raise ValueError(f"Expected task reward weights shape {expected_shape}, got {tuple(weights.shape)}")
         self.task_reward_weights = weights
+
+    def set_gait_command_override(self, gait_command=None):
+        """Override phase/offset/bound commands for transition diagnostics."""
+        if gait_command is None:
+            self.gait_command_override = None
+            return
+        gait_command = torch.as_tensor(
+            gait_command,
+            device=self.device,
+            dtype=self.gait_templates.dtype,
+        )
+        expected_shape = (self.num_envs, self.gait_templates.shape[1])
+        if tuple(gait_command.shape) != expected_shape:
+            raise ValueError(
+                f"Expected gait command override shape {expected_shape}, "
+                f"got {tuple(gait_command.shape)}"
+            )
+        self.gait_command_override = gait_command.detach().clone()
 
     def step(self, high_level_action):
         high_level_action = torch.clip(high_level_action.to(self.device), -1.0, 1.0).detach()
@@ -356,6 +376,8 @@ class HighLevelGaitWrapper:
     def _map_action(self, action):
         selector_weights = self._selector_weights(action)
         gait_command = selector_weights @ self.gait_templates
+        if self.gait_command_override is not None:
+            gait_command = self.gait_command_override
         behavior_command = self._behavior_from_residual(selector_weights, action[:, self.num_gaits :])
         return {
             "selector_weights": selector_weights,

@@ -112,6 +112,10 @@ class Cfg(PrefixProto, cli=False):
         exclusive_command_sampling = False
         num_commands = 3
         resampling_time = 10.  # time before command are changed[s]
+        # Optional low-level fine-tuning mode. A positive value changes only
+        # the gait family at this interval while preserving all other commands.
+        gait_transition_interval_s = 0.0
+        freeze_curriculum_updates = False
         subsample_gait = False
         gait_interval_s = 10.  # time between resampling gait params
         vel_interval_s = 10.
@@ -257,6 +261,10 @@ class Cfg(PrefixProto, cli=False):
         com_displacement_range = [-0.15, 0.15]
         randomize_motor_strength = False
         motor_strength_range = [0.9, 1.1]
+        # Compatibility defaults for checkpoints produced before motor-offset
+        # randomization was added to the environment implementation.
+        randomize_motor_offset = False
+        motor_offset_range = [-0.02, 0.02]
         randomize_Kp_factor = False
         Kp_factor_range = [0.8, 1.3]
         randomize_Kd_factor = False
