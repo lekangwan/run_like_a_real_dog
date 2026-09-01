@@ -1,0 +1,40 @@
+{
+  "task_id": "flat_trot_efficiency",
+  "vx": 1.0,
+  "checkpoint": "runs/high_level_oracle_gait/20260720_v4_flat_ramp_per_env_baseline_seed22550_stage2_iter050_direct/checkpoints/high_level_000049.pt",
+  "checkpoint_iteration": 49,
+  "duration_seconds": 17.0,
+  "fps": 15,
+  "frames": 255,
+  "resolution": [
+    1920,
+    1080
+  ],
+  "terrain_length": 36.0,
+  "terrain_width": 10.0,
+  "dominant_gait": "trot",
+  "gait_frame_counts": {
+    "pronk": 84,
+    "trot": 112,
+    "bound": 59,
+    "pace": 0
+  },
+  "mean_reward": 0.87707612397624,
+  "mean_vx_abs_error": 0.12783027045867024,
+  "video": "ppt_assets/continuous_route/p2_continuous_four_terrain.mp4",
+  "control_mode": "position_scheduled_gait_visualization",
+  "terrain_sequence": [
+    "平地",
+    "连续上坡",
+    "粗糙坡面",
+    "踏石"
+  ],
+  "gait_sequence": [
+    "trotting",
+    "pronking",
+    "trotting",
+    "bounding"
+  ],
+  "heading_control": "Spawn yaw fixed to zero with proportional yaw/lateral route correction.",
+  "claim_limit": "Continuous execution demo only; not evidence of autonomous terrain recognition or navigation."
+}

@@ -1,0 +1,28 @@
+{
+  "task_id": "stepping_stones_easy_bound_highspeed",
+  "vx": 2.0,
+  "checkpoint": "runs/high_level_oracle_gait/20260720_v4_flat_ramp_per_env_baseline_seed22550_stage2_iter050_direct/checkpoints/high_level_000049.pt",
+  "checkpoint_iteration": 49,
+  "duration_seconds": 3.0,
+  "fps": 10,
+  "frames": 30,
+  "resolution": [
+    1280,
+    720
+  ],
+  "terrain_length": 12.0,
+  "terrain_width": 6.0,
+  "dominant_gait": "trot",
+  "gait_frame_counts": {
+    "pronk": 0,
+    "trot": 30,
+    "bound": 0,
+    "pace": 0
+  },
+  "mean_reward": 0.523083570599556,
+  "mean_vx_abs_error": 0.900197970867157,
+  "video": "ppt_assets/recordings/stones/stepping_stones_easy_bound_highspeed_vx2p00.mp4",
+  "control_mode": "forced_gait_visualization",
+  "forced_gait": "trotting",
+  "claim_limit": "Visualizes gait execution; not evidence of autonomous gait selection."
+}
