@@ -1,10 +1,15 @@
 # Current Gait Adaptation Plan
 
+> Historical experiment log. For the current validated conclusion and next-step order,
+> read `CURRENT_PROJECT_STATUS.md` first. New experiments should update the short status
+> after their evidence is complete instead of treating this long log as the entrypoint.
+
 Date: 2026-07-04
 
-This is the current source-of-truth project note for the high-level Go2 gait
-adaptation work. It supersedes the next-step recommendations in
-`CONVERSATION_HANDOFF_20260608.md` and `CONVERSATION_HANDOFF_20260611.md`.
+This is the chronological experiment log for the high-level Go2 gait adaptation
+work. It superseded the next-step recommendations in
+`CONVERSATION_HANDOFF_20260608.md` and `CONVERSATION_HANDOFF_20260611.md`, but
+the current project status now lives in `CURRENT_PROJECT_STATUS.md`.
 
 ## Operational Safety Rule
 
@@ -13016,3 +13021,44 @@ seed 21850 平均结束率    0.02118          0.02106
 停止继续扩大当前未训练场景的随机种子扫描，保留成对基准作为后续模型
 必须通过的检验。
 ```
+
+## 低层步态转换微调（2026-08-05）
+
+新的诊断表明，冻结的原始 WTW 低层策略虽然能稳定执行单一步态，但在
+小跑切换为跳跃步态后的前 1 秒内，速度跟踪、功率和冲击通常都明显变差。
+固定相位、线性插值以及等待接触状态再切换都没有解决这个问题。因此，
+高层策略当前缺少可靠的快速步态转换执行器。
+
+原始 WTW 训练每 10 秒才完整重采样一次命令，一个 20 秒回合通常只有一次
+命令变化，而且速度、步态和连续参数同时变化。原奖励没有启用足端落地速度
+惩罚。这使低层策略很少获得来源清楚、密集的步态转换训练样本。
+
+已新增独立微调入口：
+
+```text
+scripts/finetune_low_level_gait_transitions.py
+```
+
+微调协议：
+
+```text
+1. 从原 ac_weights_019999.pt 本地加载模型，只在新目录保存结果；
+2. 每个回合开始时正常采样速度与连续参数；
+3. 回合内部约每 2 秒只切换步态，其余命令保持不变；
+4. 新步态必定不同于当前步态，三个候选等概率；
+5. 冻结命令课程更新，避免混合步态回报污染原课程统计；
+6. 使用固定小学习率，关闭会自动放大学习率的调度；
+7. 增加较小的落地速度惩罚，先检查是否减少转换冲击；
+8. 第一阶段只训练 5 次更新，确认稳定后才允许扩大训练量。
+```
+
+该实验不是为了强迫低层使用某种步态，而是补足原训练数据中稀缺的步态
+转换能力。是否有效必须同时由转换后 1 秒性能和稳态步态能力判断；如果转换
+改善却破坏原有稳态能力，也不能接受。
+
+第一次 `20260805_smoke_iter005` 结果作废。该入口错误地按当前训练脚本重建
+配置，而没有恢复原检查点对应的 `parameters.pkl`，造成初始高度、关节刚度、
+阻尼、地形尺寸和部分奖励系数与原训练不同。仅 5 次更新后便出现严重性能
+退化。这是实验协议错误，不能用于判断转换微调是否有效。入口现已改为先从
+源运行目录恢复原始配置，再施加步态转换间隔、冲击惩罚和低学习率等少量显式
+覆盖；修复后的实验必须使用新输出目录。

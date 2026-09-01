@@ -1,9 +1,12 @@
 # Active Project Context
 
+> Current canonical status: `CURRENT_PROJECT_STATUS.md` (2026-08-31).
+> This file is a historical operational log and is no longer the first reading entry.
+
 This file is the short entrypoint for the current Go2 gait-adaptation project.
 Read this before editing training, evaluation, or visualization scripts.
 
-Current short project entrypoint, 2026-07-23:
+Historical short project entrypoint, 2026-07-23:
 
 ```text
 PROJECT_STATUS_20260723.md
@@ -27,7 +30,7 @@ REPORT_READY_PROJECT_STATUS_20260721.md
 
 The report snapshot contains the detailed table and experiment protocol.
 
-Current source-of-truth plan:
+Historical chronological experiment log:
 
 ```text
 CURRENT_GAIT_ADAPTATION_PLAN.md
@@ -48,6 +51,19 @@ projects.
 
 Before reporting that work has stopped, verify against the host process list
 and nvidia-smi. A sandbox-only process check is not sufficient.
+```
+
+Execution ownership rule, 2026-08-02:
+
+```text
+Codex must never start, resume, or leave running Go2 training, IsaacGym
+simulation, or GPU evaluation itself. For every such job, Codex may prepare
+inputs and provide exactly the terminal command, but the user starts it in
+their own terminal. This applies during both daytime and nighttime and
+supersedes all earlier authorization for autonomous test or training runs.
+
+Codex may autonomously perform CPU-only output analysis and lightweight code
+checks after the user reports that a run has completed.
 ```
 
 Night GPU reliability note, 2026-07-19:

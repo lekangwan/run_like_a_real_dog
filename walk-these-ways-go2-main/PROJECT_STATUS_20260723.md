@@ -1,8 +1,12 @@
 # Go2 步态自适应项目总入口
 
+> **历史快照：** 本文冻结于 2026-07-23，仅用于复现当时汇报口径。
+> 当前状态请阅读 [`CURRENT_PROJECT_STATUS.md`](CURRENT_PROJECT_STATUS.md)。八月实验已经
+> 修正了本文对 WTW 能力边界和快速步态切换能力的理解。
+
 更新日期：2026-07-23
 
-这份文件是当前项目的唯一入口。历史过程保存在
+这份文件曾是七月汇报阶段的项目入口。历史过程保存在
 `CURRENT_GAIT_ADAPTATION_PLAN.md`，汇报数据细节保存在
 `REPORT_READY_PROJECT_STATUS_20260721.md`。
 

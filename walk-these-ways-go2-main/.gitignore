@@ -55,6 +55,11 @@ cmake_install.cmake
 /reports/**/videos/
 /reports/**/videos_all_terrains/
 
+# PPT 素材目录保留可复现脚本和精选成品，但不提交本地打包副本
+/run_like_a_real_dog_ppt_assets.zip
+/ppt_assets/**/*.mp4
+/ppt_assets/**/*.gif
+
 # 已废弃的精简包装尝试
 /high_level_simple/
 

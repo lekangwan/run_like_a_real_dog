@@ -1,5 +1,11 @@
 # 基于本体感知历史的 Go2 高层步态自适应
 
+> 当前结论和下一步以 [`CURRENT_PROJECT_STATUS.md`](CURRENT_PROJECT_STATUS.md) 为准。
+> 本页保留项目概览；七月汇报模型的结果不能等同于快速步态切换能力。
+
+> 项目当前停止继续训练和结构迭代。最终模型、本地依赖和复现边界见
+> [`ARCHIVE_AND_REPRODUCIBILITY.md`](ARCHIVE_AND_REPRODUCIBILITY.md)。
+
 本项目在冻结的 Walk These Ways（WTW）Go2 底层运动策略之上增加高层控制器，
 研究机器人能否只依靠目标速度和本体感知历史，自主选择步态并调整连续步态参数。
 
@@ -22,6 +28,10 @@
 - 高速上坡和多数未见地形没有建立稳定优势；
 - 三种连续参数网络均未取得超过仿真波动的可重复收益；
 - 尚未完成仿真到实机迁移。
+
+八月的进一步诊断发现，冻结 WTW 从小跑切换到双脚跳后的前约 1 秒存在明显瞬态
+退化。七月模型的高层决定保持约 10 秒，因此它证明的是长保持条件下的局部选择收益，
+尚不能证明面对快速变化地形时能够及时适应。
 
 因此，本项目目前不能声称完成了全地形步态自适应。更准确的结论是：
 
@@ -119,10 +129,24 @@
 
 ## 代码入口
 
-### 推荐阅读的最小实现
+### 当前真实实验主线
+
+最终实验的训练和评测链以 [`scripts/`](scripts/) 为基础。由于该目录同时保留了
+历史实验和诊断工具，第一次阅读时先看 [`scripts/README.md`](scripts/README.md)，
+不要按文件名从头遍历。
+
+核心入口是：
+
+```text
+scripts/train_high_level_oracle_ppo.py
+scripts/evaluate_high_level_policy_by_task.py
+scripts/analyze_adaptive_vs_forced_trot.py
+```
+
+### 推荐学习的最小实现
 
 [`high_level_minimal/`](high_level_minimal/) 提供不依赖原大型 `scripts/` 的高层
-主线实现，包含：
+教学实现，包含：
 
 ```text
 任务分配
@@ -145,10 +169,10 @@ PPO 强化学习
 > Isaac Gym 短训练验证。当前汇报结果由原 `scripts/` 实验链产生，不能假定
 > 最小实现已经复现了相同数值结果。
 
-### 历史实验实现
+### 完整实验实现
 
-`scripts/` 保留完整实验演化、奖励审查、成对评测、信息通路诊断和历史兼容功能。
-它适合追溯结果，但不建议作为第一次阅读项目的入口。
+`scripts/` 同时包含最终实验入口、完整实验演化、奖励审查、成对评测、信息通路诊断和
+历史兼容功能。它是结果复现的代码基础，但不建议在没有索引的情况下从头阅读。
 
 ## 环境要求
 
@@ -245,8 +269,8 @@ PYTHONPATH=$PWD python3 -m high_level_minimal.evaluate \
 ## 仓库结构
 
 ```text
-high_level_minimal/   当前高层主线的可读最小实现
-scripts/              历史训练、诊断和评测工具
+scripts/              当前真实高层训练、评测及历史诊断工具
+high_level_minimal/   用于学习的可读最小实现
 go2_gym/              Go2 仿真环境、奖励和基础封装
 go2_gym_learn/        底层强化学习基础设施
 go2_gym_deploy/       Go2 实机部署与 Unitree SDK2 接口
@@ -255,6 +279,8 @@ reports/              精选汇报图、说明和视频
 runs/                 本地训练输出，不上传 GitHub
 logs/                 本地底层训练日志，不上传 GitHub
 ```
+
+仓库所有入口文档的用途见 [`PROJECT_INDEX.md`](PROJECT_INDEX.md)。
 
 ## 已知局限
 
