@@ -1,7 +1,7 @@
 # Go2 项目汇报阶段状态
 
 > **历史快照：** 本文只代表 2026-07-21 至 2026-07-23 的汇报证据。
-> 当前项目判断请阅读 [`CURRENT_PROJECT_STATUS.md`](CURRENT_PROJECT_STATUS.md)。
+> 当前项目判断请阅读 [`CURRENT_PROJECT_STATUS.md`](../../CURRENT_PROJECT_STATUS.md)。
 
 日期：2026-07-21（2026-07-23 更新材料状态）
 

@@ -238,31 +238,45 @@ def generate_eval_comparison() -> None:
     rows = paired_rows()
     speeds = (1.0, 1.5)
     metrics = (
-        ("速度误差", "delta_vx_err_mean_mean", 100.0, "x 10^-2 m/s", "越低越好"),
-        ("接触滑移", "delta_contact_slip_penalty_mean", 1000.0, "x 10^-3", "越低越好"),
-        ("落地冲击", "delta_impact_velocity_rms_mean", 100.0, "x 10^-2 m/s", "越低越好"),
-        ("机械功率", "delta_mechanical_power_abs_mean", 1.0, "W", "越低越好"),
+        ("速度误差", "adaptive_vx_err_mean_mean", "forced_trot_vx_err_mean_mean", "m/s", 3),
+        ("接触滑移", "adaptive_contact_slip_penalty_mean", "forced_trot_contact_slip_penalty_mean", "归一化值", 3),
+        ("落地冲击", "adaptive_impact_velocity_rms_mean", "forced_trot_impact_velocity_rms_mean", "m/s", 3),
+        ("机械功率", "adaptive_mechanical_power_abs_mean", "forced_trot_mechanical_power_abs_mean", "W", 1),
     )
     fig, axes = plt.subplots(1, 4, figsize=(19.2, 10.8), dpi=100)
-    fig.suptitle("中速上坡：自适应步态相对固定小跑的变化", fontsize=31, color=NAVY,
+    fig.suptitle("中速上坡：自适应策略与固定小跑对比", fontsize=31, color=NAVY,
                  weight="bold", x=0.055, ha="left", y=0.93)
-    fig.text(0.055, 0.872, "跟踪与接触安全改善，但存在机械功率代价；差值 = 自适应策略 − 固定小跑",
+    fig.text(0.055, 0.872, "柱高为三个随机种子的实测均值；四项指标均为越低越好",
              fontsize=17, color=MUTED)
-    for ax, (title, key, scale, unit, direction) in zip(axes, metrics):
-        vals = [float(rows[("ramp_up", speed)][key]) * scale for speed in speeds]
-        colors = [GREEN if value < 0 else RED for value in vals]
-        bars = ax.bar(["1.0 m/s", "1.5 m/s"], vals, color=colors, width=0.58)
-        ax.axhline(0, color=INK, linewidth=1.2)
+    x = np.arange(len(speeds))
+    width = 0.34
+    for ax, (title, adaptive_key, baseline_key, unit, decimals) in zip(axes, metrics):
+        adaptive = [float(rows[("ramp_up", speed)][adaptive_key]) for speed in speeds]
+        baseline = [float(rows[("ramp_up", speed)][baseline_key]) for speed in speeds]
+        adaptive_bars = ax.bar(x - width / 2, adaptive, width, color=GREEN, label="自适应策略")
+        baseline_bars = ax.bar(x + width / 2, baseline, width, color=BLUE, label="固定小跑")
         ax.set_title(title, fontsize=21, color=INK, weight="bold", pad=18)
-        ax.text(0.5, 1.01, f"{direction} · {unit}", transform=ax.transAxes, ha="center",
+        ax.text(0.5, 1.01, f"越低越好 · {unit}", transform=ax.transAxes, ha="center",
                 fontsize=12, color=MUTED)
-        span = max(max(abs(v) for v in vals), 0.001)
-        ax.set_ylim(min(-span * 1.35, min(vals) * 1.35), max(span * 1.35, max(vals) * 1.35))
-        for bar, value in zip(bars, vals):
-            offset = span * 0.07
-            ax.text(bar.get_x() + bar.get_width() / 2, value + (offset if value >= 0 else -offset),
-                    f"{value:+.2f}", ha="center", va="bottom" if value >= 0 else "top",
-                    fontsize=16, weight="bold", color=INK)
+        ymax = max(adaptive + baseline) * 1.24
+        ax.set_ylim(0, ymax)
+        ax.set_xticks(x, [f"{speed:.1f} m/s" for speed in speeds])
+        for pair_index, (adaptive_bar, baseline_bar, adaptive_value, baseline_value) in enumerate(
+            zip(adaptive_bars, baseline_bars, adaptive, baseline)
+        ):
+            for bar, value in ((adaptive_bar, adaptive_value), (baseline_bar, baseline_value)):
+                is_better = value == min(adaptive_value, baseline_value)
+                label = f"{value:.{decimals}f}"
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    value + ymax * 0.025,
+                    label,
+                    ha="center",
+                    va="bottom",
+                    fontsize=13,
+                    weight="bold" if is_better else "normal",
+                    color=INK,
+                )
         ax.grid(axis="y", color=GRAY, linewidth=0.8, alpha=0.65)
         ax.set_axisbelow(True)
         for spine in ("top", "right", "left"):
@@ -270,12 +284,15 @@ def generate_eval_comparison() -> None:
         ax.tick_params(axis="x", labelsize=13)
         ax.tick_params(axis="y", labelsize=11)
 
-    fig.text(0.055, 0.115, "绿色表示该指标改善；红色表示代价增加。两种速度的奖励差均为正，且三个随机种子均保持正向。",
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.145), ncol=2,
+               frameon=False, fontsize=15)
+    fig.text(0.055, 0.105, "自适应策略降低了速度误差、接触滑移和落地冲击，但机械功率高于固定小跑。",
              fontsize=14, color=INK, weight="bold")
     fig.text(0.055, 0.072,
              "数据来源：paired_three_seed_summary.csv；同检查点、同地形、同随机种子，自适应选择器与强制小跑严格成对评测。",
              fontsize=12.5, color=MUTED)
-    fig.subplots_adjust(left=0.055, right=0.975, top=0.78, bottom=0.20, wspace=0.34)
+    fig.subplots_adjust(left=0.055, right=0.975, top=0.78, bottom=0.23, wspace=0.34)
     save_figure(fig, "p2_eval_comparison.png")
 
 
@@ -291,40 +308,59 @@ def generate_ood_generalization() -> None:
     }
     gait_names = {"trot": "小跑", "pronk": "双脚跳", "bound": "跳跃", "pace": "踱步"}
     columns = (
-        ("奖励差", "delta_reward_mean_mean", True, "+.4f"),
-        ("速度误差差", "delta_vx_err_mean_mean", False, "+.4f"),
-        ("功率差 / W", "delta_mechanical_power_abs_mean", False, "+.2f"),
-        ("接触滑移差", "delta_contact_slip_penalty_mean", False, "+.4f"),
-        ("冲击差", "delta_impact_velocity_rms_mean", False, "+.4f"),
-        ("擦碰差", "delta_scuffing_ratio_mean", False, "+.4f"),
+        ("速度误差", "adaptive_vx_err_mean_mean", "forced_trot_vx_err_mean_mean"),
+        ("机械功率", "adaptive_mechanical_power_abs_mean", "forced_trot_mechanical_power_abs_mean"),
+        ("接触滑移", "adaptive_contact_slip_penalty_mean", "forced_trot_contact_slip_penalty_mean"),
+        ("落地冲击", "adaptive_impact_velocity_rms_mean", "forced_trot_impact_velocity_rms_mean"),
+        ("足端擦碰", "adaptive_scuffing_ratio_mean", "forced_trot_scuffing_ratio_mean"),
     )
-    table_rows = []
-    cell_colors = []
+    ranked_rows = []
     for row in rows:
         short, display = task_meta[row["task_id"]]
         speed = float(row["cmd_vx"])
         gait_row = gait_lookup[(short, speed)]
         gait = max(("trot", "pronk", "bound", "pace"), key=lambda key: float(gait_row[key]))
-        values = [f"{display} {speed:.1f}", f"{gait_names[gait]}\n{float(gait_row[gait]) * 100:.1f}%"]
-        colors = ["#F5F7FA", "#EAF3FA"]
-        for _, key, higher_better, fmt in columns:
-            value = float(row[key])
-            values.append(format(value, fmt))
-            improved = value > 0 if higher_better else value < 0
-            colors.append("#DFF2EA" if improved else "#F8DFDF")
-        table_rows.append(values)
-        cell_colors.append(colors)
+        improvements = []
+        for _, adaptive_key, baseline_key in columns:
+            adaptive_value = float(row[adaptive_key])
+            baseline_value = float(row[baseline_key])
+            improvement = 100.0 * (baseline_value - adaptive_value) / baseline_value
+            improvements.append(improvement)
+        ranked_rows.append({
+            "scene": f"{display} {speed:.1f}",
+            "gait": f"{gait_names[gait]}\n{float(gait_row[gait]) * 100:.1f}%",
+            "improvements": improvements,
+            "summary": statistics.mean(improvements),
+        })
 
-    headers = ["未见场景", "主要步态"] + [item[0] for item in columns]
+    ranked_rows.sort(key=lambda item: float(item["summary"]), reverse=True)
+    column_best = [max(float(item["improvements"][idx]) for item in ranked_rows)
+                   for idx in range(len(columns))]
+    table_rows = []
+    cell_colors = []
+    for rank, item in enumerate(ranked_rows, start=1):
+        improvements = [float(value) for value in item["improvements"]]
+        table_rows.append([
+            str(rank), str(item["scene"]), str(item["gait"]),
+            *(f"{value:+.1f}%" for value in improvements),
+        ])
+        cell_colors.append([
+            "#EAF3FA" if rank == 1 else "#F5F7FA",
+            "#EAF3FA" if rank == 1 else "#F5F7FA",
+            "#EAF3FA",
+            *("#DFF2EA" if value >= 0 else "#F8DFDF" for value in improvements),
+        ])
+
+    headers = ["排名", "未见场景", "主要步态"] + [item[0] for item in columns]
     fig, ax = plt.subplots(figsize=(19.2, 10.8), dpi=100)
     ax.axis("off")
-    fig.text(0.055, 0.92, "未见地形评测：相对固定小跑的变化", fontsize=31, color=NAVY, weight="bold")
-    fig.text(0.055, 0.865, "绿色为该指标改善，红色为退化；差值 = 自适应策略 − 固定小跑",
+    fig.text(0.055, 0.92, "未见地形综合性能评测", fontsize=31, color=NAVY, weight="bold")
+    fig.text(0.055, 0.865, "表中为相对固定小跑的改善比例：正值表示改善，负值表示退化",
              fontsize=17, color=MUTED)
     table = ax.table(
         cellText=table_rows, colLabels=headers, cellColours=cell_colors,
         colColours=[NAVY] * len(headers), cellLoc="center", colLoc="center",
-        colWidths=[0.14, 0.11, 0.105, 0.12, 0.105, 0.12, 0.105, 0.105],
+        colWidths=[0.065, 0.15, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12],
         bbox=[0.04, 0.25, 0.92, 0.50],
     )
     table.auto_set_font_size(False)
@@ -336,18 +372,22 @@ def generate_ood_generalization() -> None:
         if row_index == 0:
             cell.get_text().set_color("white")
             cell.get_text().set_weight("bold")
-        elif col_index < 2:
+        elif col_index < 3:
             cell.get_text().set_weight("bold")
             cell.get_text().set_color(INK)
+        elif col_index >= 3:
+            value = float(ranked_rows[row_index - 1]["improvements"][col_index - 3])
+            if np.isclose(value, column_best[col_index - 3]):
+                cell.get_text().set_weight("bold")
 
     fig.text(0.055, 0.175,
-             "粗糙地面：冲击下降，但跟踪、功率和综合奖励多数退化，未形成有效泛化。",
+             "踏石两档速度的综合取舍相对较好；粗糙地面仅冲击等局部指标改善，多数指标仍退化。",
              fontsize=15, color=INK, weight="bold")
     fig.text(0.055, 0.125,
-             "踏石：两种速度均有小幅跟踪、功率和冲击改善，但仍约 94% 选择小跑；绝对速度误差为 0.644 与 0.816 m/s。",
+             "排序按五项相对改善比例等权平均，仅用于汇总展示；不代表新的训练奖励或统计显著性。",
              fontsize=15, color=INK, weight="bold")
     fig.text(0.055, 0.075,
-             "测试协议：主模型未在这两类地形训练；每个点 32 个环境 × 1000 步 × 3 个新随机种子，与固定小跑严格成对比较。",
+             "比例 =（固定小跑 − 自适应策略）/ 固定小跑；每点 32 个环境 × 1000 步 × 3 个新随机种子。",
              fontsize=12.5, color=MUTED)
     save_figure(fig, "p2_ood_generalization.png")
 

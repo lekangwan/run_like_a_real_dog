@@ -1,6 +1,6 @@
 # Go2 项目文件总索引
 
-更新日期：2026-08-31
+更新日期：2026-09-21
 
 这份文件只回答两个问题：现在应该从哪里开始看，以及不同文档分别有什么用途。
 
@@ -12,7 +12,8 @@
 4. [`scripts/README.md`](scripts/README.md)：真实实验代码的分类与阅读顺序。
 5. [`INTERVIEW_QA.md`](INTERVIEW_QA.md)：面试问题和口述答案。
 
-`PROJECT_STATUS_20260723.md` 和 `REPORT_READY_PROJECT_STATUS_20260721.md` 都是七月汇报快照，
+`docs/history/PROJECT_STATUS_20260723.md` 和
+`docs/history/REPORT_READY_PROJECT_STATUS_20260721.md` 都是七月汇报快照，
 不包含八月对 WTW 能力边界和快速切换瞬态的修正结论。
 
 ## 2. 深入理解
@@ -22,8 +23,8 @@
 | `CURRENT_PROJECT_STATUS.md` | 截至 2026-08-31 的可信结论、未完成项和下一步 |
 | `ARCHIVE_AND_REPRODUCIBILITY.md` | 本地模型、环境依赖、可复现与不可复现边界 |
 | `MODEL_ARTIFACTS.sha256` | 最终高层模型、原 WTW 模型与源配置的文件校验值 |
-| `DETAILED_PROJECT_REVIEW_20260723.md` | 重建项目目标、结构、奖励演变和关键实验逻辑 |
-| `REPORT_READY_PROJECT_STATUS_20260721.md` | 汇报数据、图表和结论边界 |
+| `docs/history/DETAILED_PROJECT_REVIEW_20260723.md` | 重建项目目标、结构、奖励演变和关键实验逻辑 |
+| `docs/history/REPORT_READY_PROJECT_STATUS_20260721.md` | 汇报数据、图表和结论边界 |
 | `high_level_minimal/LEARNING_ROADMAP.md` | 从零阅读高层控制代码的学习顺序 |
 | `high_level_minimal/README.md` | 教学版最小实现说明 |
 
@@ -34,9 +35,9 @@
 
 | 文件 | 性质 |
 |---|---|
-| `ACTIVE_PROJECT_CONTEXT.md` | 早期至中期的完整技术上下文，体积较大 |
-| `CURRENT_GAIT_ADAPTATION_PLAN.md` | 后续逐轮实验记录和命令，体积最大 |
-| `CONVERSATION_HANDOFF_*.md` | 早期对话交接快照 |
+| `docs/history/ACTIVE_PROJECT_CONTEXT.md` | 早期至中期的完整技术上下文，体积较大 |
+| `docs/history/CURRENT_GAIT_ADAPTATION_PLAN.md` | 后续逐轮实验记录和命令，体积最大 |
+| `docs/history/CONVERSATION_HANDOFF_*.md` | 早期对话交接快照 |
 
 这些文件用于追溯，不应作为第一次阅读入口，也不应继续无限追加作为当前状态摘要。
 
@@ -57,7 +58,11 @@ runs/       本地训练与评测结果，不作为源码阅读入口
 logs/       底层模型和历史扫描日志
 reports/    精选阶段汇报材料
 ppt_assets/ 面试 PPT 图片、视频和生成脚本
+docs/history/ 早期交接记录、逐轮实验日志和七月汇报快照
 ```
+
+`ppt_assets/` 根目录只保留当前展示素材、可编辑紧凑流程图及其必要源文件；被替换的流程图
+统一放在 `ppt_assets/drafts/`，并明确标注不能用于最终汇报。
 
 ## 6. 当前整理边界
 

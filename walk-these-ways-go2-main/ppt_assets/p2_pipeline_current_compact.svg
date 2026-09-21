@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="1920" height="1080" viewBox="0 0 1920 1080">
+  <title>基于本体感知历史的 Go2 高层步态自适应控制</title>
+  <desc>用于 PPT 的可编辑流程图。除 Go2 产品图外，文字、方框和箭头均为独立矢量元素。</desc>
+  <defs>
+    <style><![CDATA[
+      .title { font: 700 54px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #14375f; }
+      .subtitle { font: 400 25px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #61748a; }
+      .section { font: 700 29px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #14375f; }
+      .box-title { font: 700 30px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #172f4d; }
+      .body { font: 500 23px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #405a74; }
+      .note { font: 500 20px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #61748a; }
+      .arrow { fill: none; stroke: #1f6fb2; stroke-width: 4; marker-end: url(#blue-arrow); }
+      .training-arrow { fill: none; stroke: #7355ad; stroke-width: 4; stroke-dasharray: 11 8; marker-end: url(#purple-arrow); }
+      .reward-arrow { fill: none; stroke: #e69a23; stroke-width: 4; stroke-dasharray: 11 8; marker-end: url(#orange-arrow); }
+    ]]></style>
+    <marker id="blue-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#1f6fb2"/>
+    </marker>
+    <marker id="purple-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#7355ad"/>
+    </marker>
+    <marker id="orange-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#e69a23"/>
+    </marker>
+  </defs>
+
+  <rect width="1920" height="1080" fill="#ffffff"/>
+  <g id="header">
+    <text x="960" y="76" text-anchor="middle" class="title">基于本体感知历史的 Go2 高层步态自适应控制</text>
+    <text x="960" y="119" text-anchor="middle" class="subtitle">训练时利用仿真特权信息辅助表征学习，部署时仅使用目标速度与本体感知历史</text>
+    <line x1="115" y1="145" x2="1805" y2="145" stroke="#37a5b8" stroke-width="5"/>
+  </g>
+
+  <rect x="42" y="175" width="1836" height="780" rx="4" fill="none"
+        stroke="#14375f" stroke-width="2.5" stroke-dasharray="9 7"/>
+  <text x="75" y="222" class="section">控制流程</text>
+
+  <g id="inputs">
+    <rect x="70" y="319" width="245" height="112" rx="8" fill="#f2f7fb" stroke="#1f6fb2" stroke-width="3"/>
+    <text x="192" y="369" text-anchor="middle" class="box-title">目标速度</text>
+    <text x="192" y="405" text-anchor="middle" class="body">前向速度指令</text>
+    <rect x="70" y="488" width="245" height="132" rx="8" fill="#f2f7fb" stroke="#1f6fb2" stroke-width="3"/>
+    <text x="192" y="541" text-anchor="middle" class="box-title">本体感知历史</text>
+    <text x="192" y="579" text-anchor="middle" class="body">10 帧 · 510 维</text>
+    <path d="M315 349 H700 V300 H850 V344" class="arrow"/>
+    <text x="623" y="286" text-anchor="middle" class="note">目标速度直接输入高层</text>
+    <path d="M315 590 H710 V620 H850 V596" class="arrow"/>
+    <text x="605" y="651" text-anchor="middle" class="note">当前本体状态直接输入高层</text>
+  </g>
+
+  <g id="student-encoder">
+    <rect x="405" y="375" width="260" height="190" rx="10" fill="#e5f2fa" stroke="#1f6fb2" stroke-width="3"/>
+    <text x="535" y="449" text-anchor="middle" class="box-title">学生历史编码器</text>
+    <text x="535" y="495" text-anchor="middle" class="body">提取环境与动力学信息</text>
+    <text x="535" y="532" text-anchor="middle" class="body">16 维隐变量</text>
+    <path d="M315 554 H350 V510 H399" class="arrow"/>
+  </g>
+
+  <g id="high-level-controller">
+    <rect x="755" y="350" width="315" height="240" rx="10" fill="#dcecfb" stroke="#1f6fb2" stroke-width="3"/>
+    <text x="912" y="407" text-anchor="middle" class="box-title">高层步态控制器</text>
+    <rect x="790" y="436" width="245" height="55" rx="5" fill="#ffffff" stroke="#88afd2" stroke-width="2"/>
+    <text x="912" y="473" text-anchor="middle" class="body">四类步态选择</text>
+    <rect x="790" y="510" width="245" height="55" rx="5" fill="#ffffff" stroke="#88afd2" stroke-width="2"/>
+    <text x="912" y="547" text-anchor="middle" class="body">五个连续参数调节</text>
+    <path d="M665 470 H749" class="arrow"/>
+    <text x="707" y="450" text-anchor="middle" class="note">隐变量</text>
+  </g>
+
+  <g id="wtw-policy">
+    <rect x="1185" y="375" width="250" height="190" rx="10" fill="#e8f5ef" stroke="#2d8f70" stroke-width="3"/>
+    <text x="1310" y="445" text-anchor="middle" class="box-title">冻结的 WTW</text>
+    <text x="1310" y="486" text-anchor="middle" class="box-title">底层策略</text>
+    <text x="1310" y="529" text-anchor="middle" class="body">低层控制频率 50 Hz</text>
+    <path d="M1070 470 H1179" class="arrow"/>
+    <text x="1125" y="438" text-anchor="middle" class="note">步态类型</text>
+    <text x="1125" y="463" text-anchor="middle" class="note">+ 连续参数</text>
+  </g>
+
+  <g id="joint-control">
+    <rect x="1510" y="390" width="220" height="160" rx="10" fill="#f2f7fb" stroke="#1f6fb2" stroke-width="3"/>
+    <text x="1620" y="450" text-anchor="middle" class="box-title">12维关节目标</text>
+    <text x="1620" y="493" text-anchor="middle" class="box-title">PD 控制</text>
+    <text x="1620" y="528" text-anchor="middle" class="note">驱动物理仿真或实机</text>
+    <path d="M1435 470 H1504" class="arrow"/>
+  </g>
+
+  <g id="unitree-go2">
+    <image x="1718" y="385" width="150" height="118" preserveAspectRatio="xMidYMid meet"
+           href="p2_go2_cutout.png" xlink:href="p2_go2_cutout.png"/>
+    <text x="1793" y="548" text-anchor="middle" class="body">Unitree Go2</text>
+    <path d="M1730 470 H1746" class="arrow"/>
+  </g>
+
+  <g id="teacher-supervision">
+    <rect x="388" y="688" width="294" height="134" rx="9" fill="#f2edfa" stroke="#7355ad" stroke-width="3" stroke-dasharray="10 7"/>
+    <text x="535" y="739" text-anchor="middle" class="box-title">训练期教师编码器</text>
+    <text x="535" y="779" text-anchor="middle" class="body">14维仿真特权物理量</text>
+    <text x="535" y="849" text-anchor="middle" class="note" fill="#7355ad">部署时完全移除</text>
+    <path d="M535 688 V571" class="training-arrow"/>
+    <text x="554" y="647" class="note" fill="#7355ad">表征对齐</text>
+  </g>
+
+  <g id="unified-reward">
+    <rect x="760" y="688" width="520" height="134" rx="9" fill="#fff6df" stroke="#e69a23" stroke-width="3" stroke-dasharray="10 7"/>
+    <text x="1020" y="737" text-anchor="middle" class="box-title">统一物理奖励</text>
+    <text x="1020" y="779" text-anchor="middle" class="body">速度跟踪 · 稳定性 · 接触安全 · 机械功率</text>
+    <path d="M912 688 V596" class="reward-arrow"/>
+    <text x="930" y="651" class="note" fill="#b16c00">PPO 更新</text>
+    <path d="M1175 895 V828" class="reward-arrow"/>
+    <text x="1193" y="866" class="note" fill="#b16c00">轨迹指标</text>
+  </g>
+
+  <g id="feedback-loop">
+    <path d="M1804 570 V895 H192 V626" class="arrow"/>
+    <rect x="1367" y="869" width="300" height="51" rx="4" fill="#ffffff"/>
+    <text x="1517" y="903" text-anchor="middle" class="body">关节 · 机身 · 接触反馈</text>
+  </g>
+
+  <g id="deployment-note">
+    <rect x="70" y="982" width="1780" height="66" rx="7" fill="#eaf4fb"/>
+    <text x="410" y="1025" text-anchor="middle" class="section">部署输入：目标速度 + 本体感知历史</text>
+    <line x1="790" y1="993" x2="790" y2="1037" stroke="#14375f" stroke-width="2"/>
+    <text x="1320" y="1024" text-anchor="middle" class="body">无任务编号 · 无地形标签 · 无相机 · 无激光雷达</text>
+  </g>
+</svg>

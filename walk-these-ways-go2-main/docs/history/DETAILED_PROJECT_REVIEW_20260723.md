@@ -2,7 +2,7 @@
 
 > **历史技术复盘：** 本文系统整理到 2026-07-23。八月新增的 WTW 能力边界、
 > 快速切换瞬态和底层转换微调状态见
-> [`CURRENT_PROJECT_STATUS.md`](CURRENT_PROJECT_STATUS.md)。
+> [`CURRENT_PROJECT_STATUS.md`](../../CURRENT_PROJECT_STATUS.md)。
 
 更新日期：2026-07-23
 

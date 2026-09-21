@@ -97,7 +97,7 @@
 统一规则有助于减少地形特定先验，但并不自动等于绝对公平。指标定义、归一化、
 统计窗口和权重仍会影响结果。项目对奖励经历了在线与离线一致性检查、固定配置
 检查、公平参数搜索和独立随机种子复核。完整过程见
-[`DETAILED_PROJECT_REVIEW_20260723.md`](DETAILED_PROJECT_REVIEW_20260723.md)。
+[`DETAILED_PROJECT_REVIEW_20260723.md`](docs/history/DETAILED_PROJECT_REVIEW_20260723.md)。
 
 ## 核心结果
 
@@ -276,6 +276,8 @@ go2_gym_learn/        底层强化学习基础设施
 go2_gym_deploy/       Go2 实机部署与 Unitree SDK2 接口
 resources/            机器人、地形和纹理资源
 reports/              精选汇报图、说明和视频
+ppt_assets/           面试 PPT 素材、数据快照和 CPU 生成脚本
+docs/history/         早期交接记录、逐轮实验日志和七月汇报快照
 runs/                 本地训练输出，不上传 GitHub
 logs/                 本地底层训练日志，不上传 GitHub
 ```

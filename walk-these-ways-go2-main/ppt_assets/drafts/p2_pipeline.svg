@@ -1,0 +1,212 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">基于本体感知历史的 Go2 高层步态自适应控制</title>
+  <desc id="desc">展示仿真训练、条件表征、高层步态控制、冻结 WTW 底层策略以及部署链路。</desc>
+
+  <defs>
+    <style><![CDATA[
+      .title { font: 700 32px "Noto Sans CJK SC","Microsoft YaHei",sans-serif; fill:#182235; }
+      .step { font: 700 23px "Noto Sans CJK SC","Microsoft YaHei",sans-serif; fill:#182235; }
+      .group { font: 700 21px "Noto Sans CJK SC","Microsoft YaHei",sans-serif; fill:#202735; }
+      .label { font: 700 18px "Noto Sans CJK SC","Microsoft YaHei",sans-serif; fill:#202735; }
+      .body { font: 16px "Noto Sans CJK SC","Microsoft YaHei",sans-serif; fill:#303a49; }
+      .small { font: 14px "Noto Sans CJK SC","Microsoft YaHei",sans-serif; fill:#4a5668; }
+      .box { fill:#fff; stroke:#252b35; stroke-width:1.6; }
+      .dash-box { fill:#fffdf9; stroke:#805151; stroke-width:1.6; stroke-dasharray:8 6; }
+      .frame { fill:none; stroke:#252a33; stroke-width:1.5; stroke-dasharray:2.5 3.5; }
+      .flow { fill:none; stroke:#313945; stroke-width:2.1; marker-end:url(#arrowBlack); }
+      .data { fill:none; stroke:#4e79a7; stroke-width:2.3; marker-end:url(#arrowBlue); }
+      .update { fill:none; stroke:#b85d5d; stroke-width:2.2; marker-end:url(#arrowRed); }
+      .align { fill:none; stroke:#76569f; stroke-width:2.1; stroke-dasharray:7 5; marker-end:url(#arrowPurple); }
+    ]]></style>
+    <marker id="arrowBlack" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#313945"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#4e79a7"/>
+    </marker>
+    <marker id="arrowRed" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#b85d5d"/>
+    </marker>
+    <marker id="arrowPurple" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#76569f"/>
+    </marker>
+  </defs>
+
+  <rect width="1600" height="900" fill="#fff"/>
+  <text x="24" y="42" class="title">A. 基于本体感知历史的 Go2 高层步态自适应控制</text>
+
+  <!-- Step 1: simulation training -->
+  <rect x="22" y="60" width="1556" height="568" class="frame"/>
+  <text x="40" y="91" class="step">Step 1. Isaac Gym 仿真训练</text>
+
+  <!-- Simulation and observations -->
+  <g id="simulation">
+    <rect x="43" y="106" width="300" height="500" rx="4" fill="#edf7e8"/>
+    <text x="61" y="138" class="group">Go2 与仿真环境</text>
+
+    <rect x="67" y="157" width="252" height="174" rx="4" fill="#fbfdf9" stroke="#34404c" stroke-width="1.5"/>
+    <path d="M82 302 H150 L184 263 H235 L258 280 H304" fill="none" stroke="#7e8a94" stroke-width="5"/>
+    <path d="M82 284 l18 -8 18 8 18 -8 18 8" fill="none" stroke="#8e9a87" stroke-width="3"/>
+    <image x="102" y="173" width="172" height="104" preserveAspectRatio="xMidYMid meet"
+           href="../p2_go2_cutout.png" xlink:href="../p2_go2_cutout.png"/>
+    <text x="193" y="350" text-anchor="middle" class="label">平地 · 斜坡 · 粗糙地形</text>
+
+    <rect x="63" y="370" width="260" height="61" class="box"/>
+    <text x="193" y="396" text-anchor="middle" class="label">目标速度</text>
+    <text x="193" y="419" text-anchor="middle" class="small">前向速度指令 vₓ</text>
+
+    <rect x="63" y="451" width="260" height="61" class="box"/>
+    <text x="193" y="477" text-anchor="middle" class="label">本体感知历史</text>
+    <text x="193" y="500" text-anchor="middle" class="small">10 帧 · 510 维</text>
+
+    <rect x="63" y="531" width="260" height="54" class="dash-box"/>
+    <text x="193" y="554" text-anchor="middle" class="label">物理指标与回合信息</text>
+    <text x="193" y="576" text-anchor="middle" class="small">跟踪 / 稳定 / 接触 / 功率</text>
+  </g>
+
+  <!-- Representation learning -->
+  <g id="representation">
+    <rect x="365" y="106" width="470" height="242" rx="4" fill="#eaf2f8"/>
+    <text x="383" y="138" class="group">条件表征学习</text>
+
+    <rect x="390" y="165" width="130" height="62" class="box"/>
+    <text x="455" y="191" text-anchor="middle" class="label">历史编码器</text>
+    <text x="455" y="214" text-anchor="middle" class="small">学生网络</text>
+
+    <rect x="390" y="260" width="130" height="62" class="dash-box"/>
+    <text x="455" y="286" text-anchor="middle" class="label">特权编码器</text>
+    <text x="455" y="309" text-anchor="middle" class="small">教师网络 · 14维</text>
+
+    <rect x="568" y="165" width="104" height="62" class="box"/>
+    <text x="620" y="190" text-anchor="middle" class="label">条件隐变量</text>
+    <text x="620" y="214" text-anchor="middle" class="small">z · 16维</text>
+
+    <polygon points="709,158 809,170 809,222 709,234" class="box"/>
+    <text x="759" y="190" text-anchor="middle" class="label">物理量解码</text>
+    <text x="759" y="214" text-anchor="middle" class="small">预测14维状态</text>
+
+    <path d="M520 196 H568" class="data"/>
+    <path d="M520 291 H548 V227" class="align"/>
+    <text x="545" y="274" class="small" fill="#76569f">表征对齐</text>
+    <path d="M672 196 H709" class="data"/>
+    <path d="M759 234 V291 H526" class="align"/>
+    <text x="663" y="287" text-anchor="middle" class="small" fill="#76569f">物理量重建约束</text>
+
+    <path d="M323 481 H350 V196 H390" class="data"/>
+  </g>
+
+  <!-- High-level and low-level control -->
+  <g id="control">
+    <rect x="855" y="106" width="700" height="242" rx="4" fill="#fceddf"/>
+    <text x="873" y="138" class="group">高层决策与底层执行</text>
+
+    <rect x="881" y="158" width="154" height="48" class="box"/>
+    <text x="958" y="179" text-anchor="middle" class="label">策略输入</text>
+    <text x="958" y="199" text-anchor="middle" class="small">vₓ + z + 预测物理量</text>
+
+    <polygon points="883,235 1038,248 1038,306 883,319" class="box"/>
+    <text x="961" y="267" text-anchor="middle" class="label">高层步态控制器</text>
+    <text x="961" y="291" text-anchor="middle" class="small">步态选择 + 参数调节</text>
+
+    <rect x="1080" y="244" width="145" height="65" class="box"/>
+    <text x="1152" y="270" text-anchor="middle" class="label">9维步态参数</text>
+    <text x="1152" y="295" text-anchor="middle" class="small">4类步态 + 5个参数</text>
+
+    <polygon points="1265,235 1394,248 1394,306 1265,319" class="box"/>
+    <text x="1330" y="267" text-anchor="middle" class="label">冻结 WTW</text>
+    <text x="1330" y="291" text-anchor="middle" class="small">50 Hz 底层策略</text>
+
+    <rect x="1433" y="238" width="98" height="74" class="box"/>
+    <text x="1482" y="263" text-anchor="middle" class="label">关节控制</text>
+    <text x="1482" y="286" text-anchor="middle" class="small">12维目标</text>
+    <text x="1482" y="304" text-anchor="middle" class="small">PD执行</text>
+
+    <path d="M809 196 H850 V182 H881" class="data"/>
+    <path d="M958 206 V235" class="data"/>
+    <path d="M1038 277 H1080" class="flow"/>
+    <path d="M1225 277 H1265" class="flow"/>
+    <path d="M1394 277 H1433" class="flow"/>
+
+    <!-- Clean execution loop back to the simulator -->
+    <path d="M1482 238 V96 H193 V157" class="flow"/>
+    <text x="1190" y="90" text-anchor="middle" class="small">WTW 输出关节目标，由 PD 控制驱动 Go2</text>
+  </g>
+
+  <!-- PPO training -->
+  <g id="training-update">
+    <rect x="365" y="368" width="1190" height="238" rx="4" fill="#f3eef8"/>
+    <text x="383" y="400" class="group">统一奖励与两阶段训练</text>
+
+    <rect x="390" y="434" width="248" height="121" class="box"/>
+    <text x="514" y="461" text-anchor="middle" class="label">统一物理奖励</text>
+    <text x="514" y="490" text-anchor="middle" class="body">速度跟踪 · 生存 · 姿态</text>
+    <text x="514" y="516" text-anchor="middle" class="body">滑移 · 冲击 · 擦碰 · 功率</text>
+    <text x="514" y="540" text-anchor="middle" class="small">所有地形使用相同定义与权重</text>
+
+    <path d="M685 434 h220 v121 h-220 c18-22 18-99 0-121 z" fill="#fff" stroke="#252b35" stroke-width="1.6"/>
+    <text x="795" y="467" text-anchor="middle" class="label">并行轨迹缓存</text>
+    <text x="795" y="497" text-anchor="middle" class="body">状态 · 步态参数 · 奖励</text>
+    <text x="795" y="525" text-anchor="middle" class="small">Isaac Gym 并行采样</text>
+
+    <polygon points="952,428 1227,443 1227,548 952,563" class="box"/>
+    <text x="1090" y="461" text-anchor="middle" class="label">PPO Actor-Critic 更新</text>
+    <text x="1090" y="491" text-anchor="middle" class="body">策略损失 · 价值损失 · 熵正则</text>
+    <text x="1090" y="519" text-anchor="middle" class="body">表征对齐 · 物理量重建</text>
+    <text x="1090" y="545" text-anchor="middle" class="small">优化高层策略与学生编码器</text>
+
+    <rect x="1274" y="434" width="249" height="121" class="box"/>
+    <text x="1399" y="462" text-anchor="middle" class="label">两阶段训练</text>
+    <text x="1399" y="490" text-anchor="middle" class="body">① 固定连续参数，学习步态</text>
+    <text x="1399" y="518" text-anchor="middle" class="body">② 冻结选择器，小幅调参</text>
+    <text x="1399" y="544" text-anchor="middle" class="small">保护已形成的步态结构</text>
+
+    <path d="M323 558 H390" class="flow"/>
+    <path d="M638 495 H685" class="flow"/>
+    <path d="M905 495 H952" class="flow"/>
+    <path d="M1227 495 H1274" class="flow"/>
+    <path d="M1090 428 V356 H961 V319" class="update"/>
+    <text x="1103" y="351" class="small" fill="#a34e4e">梯度更新</text>
+  </g>
+
+  <!-- Step 2: deployment -->
+  <rect x="22" y="650" width="1556" height="222" class="frame"/>
+  <text x="40" y="681" class="step">Step 2. 部署时的完整控制链</text>
+
+  <g id="deployment">
+    <rect x="43" y="697" width="1512" height="153" rx="4" fill="#eef5f9"/>
+    <text x="61" y="729" class="group">仅保留可在实机获得的信息与网络</text>
+
+    <rect x="70" y="758" width="220" height="61" class="box"/>
+    <text x="180" y="784" text-anchor="middle" class="label">目标速度 + 本体历史</text>
+    <text x="180" y="808" text-anchor="middle" class="small">无任务编号与地形标签</text>
+
+    <polygon points="340,750 520,763 520,815 340,828" class="box"/>
+    <text x="430" y="781" text-anchor="middle" class="label">学生历史编码器</text>
+    <text x="430" y="806" text-anchor="middle" class="small">估计条件隐变量</text>
+
+    <rect x="570" y="758" width="230" height="61" class="box"/>
+    <text x="685" y="784" text-anchor="middle" class="label">步态选择与参数调节</text>
+    <text x="685" y="808" text-anchor="middle" class="small">高层输出 9维步态参数</text>
+
+    <polygon points="850,750 1030,763 1030,815 850,828" class="box"/>
+    <text x="940" y="781" text-anchor="middle" class="label">冻结 WTW</text>
+    <text x="940" y="806" text-anchor="middle" class="small">输出12维关节目标</text>
+
+    <rect x="1080" y="758" width="190" height="61" class="box"/>
+    <text x="1175" y="784" text-anchor="middle" class="label">PD 控制与 Go2</text>
+    <text x="1175" y="808" text-anchor="middle" class="small">执行并返回本体感知</text>
+
+    <rect x="1320" y="750" width="210" height="77" class="dash-box"/>
+    <text x="1425" y="778" text-anchor="middle" class="label">部署不需要</text>
+    <text x="1425" y="802" text-anchor="middle" class="small">教师网络 / 相机 / 激光雷达</text>
+
+    <path d="M290 789 H340" class="flow"/>
+    <path d="M520 789 H570" class="flow"/>
+    <path d="M800 789 H850" class="flow"/>
+    <path d="M1030 789 H1080" class="flow"/>
+  </g>
+
+  <text x="1575" y="892" text-anchor="end" class="small">SVG 矢量图 · 文字、图形与连线均可编辑</text>
+</svg>

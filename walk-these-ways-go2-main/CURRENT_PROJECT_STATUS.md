@@ -160,9 +160,9 @@ checkpoints/high_level_000049.pt
 
 ## 九、证据入口
 
-- 七月汇报快照：`PROJECT_STATUS_20260723.md`
-- 七月完整技术复盘：`DETAILED_PROJECT_REVIEW_20260723.md`
-- 长期实验日志：`CURRENT_GAIT_ADAPTATION_PLAN.md`
+- 七月汇报快照：`docs/history/PROJECT_STATUS_20260723.md`
+- 七月完整技术复盘：`docs/history/DETAILED_PROJECT_REVIEW_20260723.md`
+- 长期实验日志：`docs/history/CURRENT_GAIT_ADAPTATION_PLAN.md`
 - WTW 能力边界：`runs/high_level_oracle_gait/wtw_capability_frontier/`
 - 快速切换成对评测：`runs/high_level_oracle_gait/paired_gait_live_reward_audit/`
 - 底层切换微调源码：`scripts/finetune_low_level_gait_transitions.py`

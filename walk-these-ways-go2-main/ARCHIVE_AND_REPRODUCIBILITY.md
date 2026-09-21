@@ -163,8 +163,8 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$PWD/scripts:$PWD python3 -B \
 2. `CURRENT_PROJECT_STATUS.md`：最终可信结论和失败边界；
 3. `ARCHIVE_AND_REPRODUCIBILITY.md`：模型与复现条件；
 4. `scripts/README.md`：真实代码入口；
-5. `DETAILED_PROJECT_REVIEW_20260723.md`：七月以前的技术演化；
-6. `CURRENT_GAIT_ADAPTATION_PLAN.md`：需要追查具体实验时再检索。
+5. `docs/history/DETAILED_PROJECT_REVIEW_20260723.md`：七月以前的技术演化；
+6. `docs/history/CURRENT_GAIT_ADAPTATION_PLAN.md`：需要追查具体实验时再检索。
 
 ## 9. 归档后的维护原则
 

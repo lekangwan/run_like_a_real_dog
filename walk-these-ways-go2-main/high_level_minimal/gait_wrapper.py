@@ -168,7 +168,9 @@ class MinimalGaitWrapper:
         """
         requested_command = requested_command.to(self.device).clamp(-1.0, 1.0).detach()
         # 离散步态立即生效；连续修正使用指数平滑，避免参数瞬间跳变。
-        self.high_level_command[:, : self.num_gaits] = self._one_hot_gait(requested_command)
+        self.high_level_command[:, : self.num_gaits] = self._one_hot_gait(
+            requested_command
+        )
         self.high_level_command[:, self.num_gaits :] = (
             self.action_smoothing * self.high_level_command[:, self.num_gaits :]
             + (1.0 - self.action_smoothing) * requested_command[:, self.num_gaits :]
@@ -186,7 +188,9 @@ class MinimalGaitWrapper:
             self._write_low_level_commands()
             with torch.inference_mode():
                 low_action = self.low_level_policy(self.low_level_obs)
-            self.low_level_obs, _, done, info = self.env.step(low_action.to(self.device))
+            self.low_level_obs, _, done, info = self.env.step(
+                low_action.to(self.device)
+            )
             reward_sum += self._reward(done)
             done_any |= done.bool()
             base = self._base_env()
@@ -208,8 +212,7 @@ class MinimalGaitWrapper:
 
         if self.record_reward_terms:
             info["high_level_reward_terms"] = {
-                name: value / self.low_level_steps
-                for name, value in term_sums.items()
+                name: value / self.low_level_steps for name, value in term_sums.items()
             }
         return (
             self.get_observations(),
@@ -227,7 +230,7 @@ class MinimalGaitWrapper:
         作用：为学生编码器提供约一秒动态信息，使其能从响应过程推断隐藏物理条件。
         """
         frame = self._proprioceptive_frame()
-        self.obs_history[:, :-self.num_high_level_obs] = self.obs_history[
+        self.obs_history[:, : -self.num_high_level_obs] = self.obs_history[
             :, self.num_high_level_obs :
         ].clone()
         self.obs_history[:, -self.num_high_level_obs :] = frame
@@ -253,8 +256,7 @@ class MinimalGaitWrapper:
         )
         actuated = self.env.num_actuated_dof
         joint_error = (
-            self.env.dof_pos[:, :actuated]
-            - self.env.default_dof_pos[:, :actuated]
+            self.env.dof_pos[:, :actuated] - self.env.default_dof_pos[:, :actuated]
         )
         joint_velocity = self.env.dof_vel[:, :actuated]
         contacts = self._foot_contacts().float()
@@ -305,11 +307,12 @@ class MinimalGaitWrapper:
         residual = self.high_level_command[:, self.num_gaits :].clamp(-1.0, 1.0)
         # 网络输出位于 [-1, 1]，先映射到各参数允许的修正区间。
         residual_unit = 0.5 * (residual + 1.0)
-        delta = self.residual_ranges[:, 0] + (
-            self.residual_ranges[:, 1] - self.residual_ranges[:, 0]
-        ) * residual_unit
-        behavior = (behavior + delta).maximum(self.behavior_lows).minimum(
-            self.behavior_highs
+        delta = (
+            self.residual_ranges[:, 0]
+            + (self.residual_ranges[:, 1] - self.residual_ranges[:, 0]) * residual_unit
+        )
+        behavior = (
+            (behavior + delta).maximum(self.behavior_lows).minimum(self.behavior_highs)
         )
         return gait, behavior
 
@@ -356,7 +359,9 @@ class MinimalGaitWrapper:
         contact_count = contact_float.sum(dim=1).clamp_min(1.0)
         foot_xy_speed_sq = self.env.foot_velocities[:, :, :2].square().sum(dim=2)
         impact, scuffing = self._contact_safety(contacts)
-        joint_power = self.env.torques * self.env.dof_vel[:, : self.env.torques.shape[1]]
+        joint_power = (
+            self.env.torques * self.env.dof_vel[:, : self.env.torques.shape[1]]
+        )
         power = joint_power.abs().sum(dim=1)
         base = self._base_env()
         edge = base.edge_reset_buf.bool()
@@ -412,9 +417,9 @@ class MinimalGaitWrapper:
         positions = self.env.foot_positions
         clearance = positions[:, :, 2] - self._ground_height(positions)
         swing = (~contacts).float()
-        scuffing = (
-            swing * (clearance < 0.035).float()
-        ).sum(dim=1) / swing.sum(dim=1).clamp_min(1.0)
+        scuffing = (swing * (clearance < 0.035).float()).sum(dim=1) / swing.sum(
+            dim=1
+        ).clamp_min(1.0)
         return impact, scuffing
 
     def _ground_height(self, foot_positions):
@@ -431,11 +436,15 @@ class MinimalGaitWrapper:
         base = self._base_env()
         cfg = base.terrain.cfg
         points = foot_positions[:, :, :2] + cfg.border_size
-        x = (points[:, :, 0] / cfg.horizontal_scale).long().clamp(
-            0, base.height_samples.shape[0] - 2
+        x = (
+            (points[:, :, 0] / cfg.horizontal_scale)
+            .long()
+            .clamp(0, base.height_samples.shape[0] - 2)
         )
-        y = (points[:, :, 1] / cfg.horizontal_scale).long().clamp(
-            0, base.height_samples.shape[1] - 2
+        y = (
+            (points[:, :, 1] / cfg.horizontal_scale)
+            .long()
+            .clamp(0, base.height_samples.shape[1] - 2)
         )
         heights = torch.minimum(
             torch.minimum(base.height_samples[x, y], base.height_samples[x + 1, y]),
@@ -464,8 +473,9 @@ class MinimalGaitWrapper:
             (
                 (heights.mean(dim=1) / 0.5).clamp(-1.0, 1.0),
                 (heights.std(dim=1) / 0.3).clamp(0.0, 1.0),
-                ((heights.max(dim=1).values - heights.min(dim=1).values) / 0.5)
-                .clamp(0.0, 1.0),
+                ((heights.max(dim=1).values - heights.min(dim=1).values) / 0.5).clamp(
+                    0.0, 1.0
+                ),
                 (heights[:, middle:].mean(dim=1) - heights[:, :middle].mean(dim=1))
                 .div(0.3)
                 .clamp(-1.0, 1.0),
@@ -482,9 +492,11 @@ class MinimalGaitWrapper:
         )
         push = torch.stack(((axes >= 0).float(), axes.clamp(-1.0, 1.0)), dim=1)
 
-        body_height = ((base.root_states[: self.num_envs, 2] - 0.34) / 0.15).clamp(
-            -1.0, 1.0
-        ).unsqueeze(1)
+        body_height = (
+            ((base.root_states[: self.num_envs, 2] - 0.34) / 0.15)
+            .clamp(-1.0, 1.0)
+            .unsqueeze(1)
+        )
         return torch.cat(
             (
                 terrain,
@@ -527,7 +539,9 @@ class MinimalGaitWrapper:
         作用：让不同网格位置的并行环境共享同一侧漂评价基准。
         """
         base = self._base_env()
-        return base.root_states[: self.num_envs, 1] - base.env_origins[: self.num_envs, 1]
+        return (
+            base.root_states[: self.num_envs, 1] - base.env_origins[: self.num_envs, 1]
+        )
 
     def __getattr__(self, name):
         """将未定义属性转发给下一层环境。
